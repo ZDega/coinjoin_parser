@@ -166,7 +166,10 @@ def create_database_datagathering():
                 -- size / weight / feerate
                 raw_size_bytes INTEGER,                     -- serialized size in bytes
                 weight INTEGER,                             -- weight units
-                fee_rate_sat_per_vbyte DOUBLE              -- fee_rate = fee / vsize
+                fee_rate_sat_per_vbyte DOUBLE,              -- fee_rate = fee / vsize
+
+                -- processing status
+                processed BOOLEAN NOT NULL DEFAULT FALSE    -- whether transaction has been processed for clustering
             )
         """)
         print("✅ Coinjoin_transactions table created successfully\n")
