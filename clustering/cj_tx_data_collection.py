@@ -6,7 +6,7 @@ in the DuckDB database according to the schema defined in data/create_data_base.
 """
 
 import os
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import duckdb
 from tqdm import tqdm
@@ -14,12 +14,24 @@ from tqdm import tqdm
 # Import existing API client
 from api_clients.mempool_client import MempoolClient
 
+# Import Pydantic models
+from models import (
+    ScriptPubkeyType,
+    TransactionInput,
+    TransactionOutput,
+    Coordinator,
+    InputAddress,
+    OutputAddress,
+    CoinjoinTransaction,
+)
+
 load_dotenv()
 
 
 # ============================================================================
 # DATABASE CONNECTION
 # ============================================================================
+
 
 class DatabaseConnection:
     """Manages DuckDB database connection and operations."""
@@ -44,27 +56,25 @@ class DatabaseConnection:
             self.conn.close()
         return False  # Don't suppress exceptions - let them propagate
 
-
-
-    def get_or_create_coordinator_id(self, coordinator_endpoint: str) -> int:
+    def get_or_create_coordinator(self, coordinator_endpoint: str) -> Coordinator:
         """
-        Get coordinator ID or create new coordinator entry.
+        Get coordinator or create new coordinator entry if it doesn't exist.
 
         Args:
             coordinator_endpoint: URL of the coordinator
 
         Returns:
-            Coordinator ID
+            Coordinator object with ID and endpoint
         """
         # Check if coordinator already exists
         result = self.conn.execute(
-            "SELECT coor_id FROM coordinators WHERE coordinator_endpoint = ?",
+            "SELECT coor_id, coordinator_endpoint FROM coordinators WHERE coordinator_endpoint = ?",
             [coordinator_endpoint]
         ).fetchone()
 
         if result:
-            # Coordinator exists, return its ID
-            return result[0]
+            # Coordinator exists, return as Coordinator object
+            return Coordinator.from_db_row(*result)
 
         # Coordinator doesn't exist, create new entry
         self.conn.execute(
@@ -72,170 +82,262 @@ class DatabaseConnection:
             [coordinator_endpoint]
         )
 
-        # Get the newly created coordinator ID
+        # Get the newly created coordinator
         result = self.conn.execute(
-            "SELECT coor_id FROM coordinators WHERE coordinator_endpoint = ?",
+            "SELECT coor_id, coordinator_endpoint FROM coordinators WHERE coordinator_endpoint = ?",
             [coordinator_endpoint]
         ).fetchone()
 
-        return result[0]
-    def get_input_address(self, address: str, script_type: str) -> Optional[Tuple[int, str, bool, str, int, int]]: #TODO implement pydantic objects for these
+        return Coordinator.from_db_row(*result)
+
+    def get_or_create_coordinator_id(self, coordinator_endpoint: str) -> int:
         """
-        Get input address ID or if doesn't exist returns Null.
+        Get coordinator ID, creating the coordinator if it doesn't exist.
 
         Args:
-            address: scriptpubkey_address in str form
+            coordinator_endpoint: URL of the coordinator
+
+        Returns:
+            Coordinator ID
+        """
+        return self.get_or_create_coordinator(coordinator_endpoint=coordinator_endpoint).coor_id
+
+    def get_input_address(self, address: str, script_type: str) -> Optional[InputAddress]:
+        """
+        Get input address from database if it exists.
+
+        Args:
+            address: Script pubkey address in hex string form
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
 
         Returns:
-            Tuple of (input_address_id, address_hex, used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
-            or None if address doesn't exist
+            InputAddress object if exists, None otherwise
 
         Raises:
             ValueError: If the stored script_type doesn't match the provided script_type
         """
-        # Check if input address already exists
+        # Query for existing input address
         result = self.conn.execute(
-            "SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj FROM input_addresses WHERE address = from_hex(?)",
+            """SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type,
+                      number_of_cjs_used_in_as_input, total_amount_spent_in_cj
+               FROM input_addresses
+               WHERE address = from_hex(?)""",
             [address]
         ).fetchone()
+
         if result:
-            # Verify script_type matches
+            # Verify script_type matches to maintain data integrity
             stored_script_type = result[3]
             if stored_script_type != script_type:
                 raise ValueError(
                     f"Script type mismatch for address {result[1]}: "
                     f"stored='{stored_script_type}', provided='{script_type}'"
                 )
-            return result
+            return InputAddress.from_db_row(*result)
 
         return None
-    
-    def get_output_address(self, address: str, script_type: str) -> Optional[Tuple[int, str, bool, str, int, int]]: #TODO implement pydantic objects for these
+
+    def get_output_address(self, address: str, script_type: str) -> Optional[OutputAddress]:
         """
-        Get input address ID or if doesn't exist returns Null.
+        Get output address from database if it exists.
 
         Args:
-            address: scriptpubkey_address in str form
+            address: Script pubkey address in hex string form
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
 
         Returns:
-            Tuple of (input_address_id, address_hex, used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
-            or None if address doesn't exist
+            OutputAddress object if exists, None otherwise
 
         Raises:
             ValueError: If the stored script_type doesn't match the provided script_type
         """
-        # Check if input address already exists
+        # Query for existing output address
         result = self.conn.execute(
-            "SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type, number_of_cjs_used_in_as_output, total_amount_received_in_cj FROM output_addresses WHERE address = from_hex(?)",
+            """SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type,
+                      number_of_cjs_used_in_as_output, total_amount_received_in_cj
+               FROM output_addresses
+               WHERE address = from_hex(?)""",
             [address]
         ).fetchone()
+
         if result:
-            # Verify script_type matches
+            # Verify script_type matches to maintain data integrity
             stored_script_type = result[3]
             if stored_script_type != script_type:
                 raise ValueError(
                     f"Script type mismatch for address {result[1]}: "
                     f"stored='{stored_script_type}', provided='{script_type}'"
                 )
-            return result
+            return OutputAddress.from_db_row(*result)
 
         return None
 
-    def update_or_insert_input_address(self, address: str, script_type: str, value: int) -> Tuple[int, str, bool, str, int, int]:
+    def update_or_insert_input_address(self, address: str, script_type: str, value: int) -> InputAddress:
         """
-        Get input address ID or create new input address entry.
+        Update existing input address statistics or create new entry if it doesn't exist.
+
+        This method increments usage counters and updates total amounts for addresses
+        used as inputs in CoinJoin transactions.
 
         Args:
-            address: scriptpubkey_address in str form
+            address: Script pubkey address in hex string form
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
             value: Input value in satoshis to add to total_amount_spent_in_cj
 
         Returns:
-            Tuple of (input_address_id, address_hex, used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
+            InputAddress object with updated values
         """
         # Check if input address already exists
         result = self.get_input_address(address, script_type)
 
         if result:
-            # Address exists, update statistics
+            # Address exists, update statistics in database
             self.conn.execute(
                 """UPDATE input_addresses
-                SET number_of_cjs_used_in_as_input = number_of_cjs_used_in_as_input + 1,
-                total_amount_spent_in_cj = total_amount_spent_in_cj + ?
-                WHERE input_address_id = ?""",
-                [value, result[0]]
+                   SET number_of_cjs_used_in_as_input = number_of_cjs_used_in_as_input + 1,
+                       total_amount_spent_in_cj = total_amount_spent_in_cj + ?
+                   WHERE input_address_id = ?""",
+                [value, result.input_address_id]
             )
-            # Return updated tuple (tuples are immutable, so create a new one with updated values)
-            return (result[0], result[1], result[2], result[3], result[4] + 1, result[5] + value)
+            # Return new object with updated values
+            return InputAddress.from_db_row(
+                result.input_address_id,
+                result.address,
+                result.used_as_output,
+                result.script_type.value,
+                result.number_of_cjs_used_in_as_input + 1,
+                result.total_amount_spent_in_cj + value
+            )
 
         # Address doesn't exist, create new entry
         self.conn.execute(
-            """INSERT INTO input_addresses (address, used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
-               VALUES (?, FALSE, ?::script_pubkey_type, 1, ?)""",
+            """INSERT INTO input_addresses (address, used_as_output, script_type,
+                                             number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
+               VALUES (from_hex(?), FALSE, ?::script_pubkey_type, 1, ?)""",
             [address, script_type, value]
         )
 
         # Get the newly created input address with full data
         result = self.conn.execute(
-            "SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj FROM input_addresses WHERE address = from_hex(?)",
+            """SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type,
+                      number_of_cjs_used_in_as_input, total_amount_spent_in_cj
+               FROM input_addresses
+               WHERE address = from_hex(?)""",
             [address]
         ).fetchone()
 
-        return result
-    
+        return InputAddress.from_db_row(*result)
 
-    def update_or_insert_output_address(self, address: str, script_type: str, value: int) -> Tuple[int, str, bool, str, int, int]:
+    def update_or_insert_output_address(self, address: str, script_type: str, value: int) -> OutputAddress:
         """
-        Get input address ID or create new input address entry.
+        Update existing output address statistics or create new entry if it doesn't exist.
+
+        This method increments usage counters and updates total amounts for addresses
+        used as outputs in CoinJoin transactions.
 
         Args:
-            address: scriptpubkey_address in str
+            address: Script pubkey address in hex string form
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
-            value: Input value in satoshis to add to total_amount_spent_in_cj
+            value: Output value in satoshis to add to total_amount_received_in_cj
 
         Returns:
-            Tuple of (input_address_id, address_hex, used_as_output, script_type, number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
+            OutputAddress object with updated values
         """
-        # Check if input address already exists
+        # Check if output address already exists
         result = self.get_output_address(address, script_type)
 
         if result:
-            # Address exists, update statistics
+            # Address exists, update statistics in database
             self.conn.execute(
                 """UPDATE output_addresses
-                SET number_of_cjs_used_in_as_output = number_of_cjs_used_in_as_output + 1,
-                total_amount_received_in_cj = total_amount_received_in_cj + ?
-                WHERE output_address_id = ?""",
-                [value, result[0]]
+                   SET number_of_cjs_used_in_as_output = number_of_cjs_used_in_as_output + 1,
+                       total_amount_received_in_cj = total_amount_received_in_cj + ?
+                   WHERE output_address_id = ?""",
+                [value, result.output_address_id]
             )
-            # Return updated tuple (tuples are immutable, so create a new one with updated values)
-            return (result[0], result[1], result[2], result[3], result[4] + 1, result[5] + value)
+            # Return new object with updated values
+            return OutputAddress.from_db_row(
+                result.output_address_id,
+                result.address,
+                result.used_as_input,
+                result.script_type.value,
+                result.number_of_cjs_used_in_as_output + 1,
+                result.total_amount_received_in_cj + value
+            )
 
         # Address doesn't exist, create new entry
         self.conn.execute(
-            """INSERT INTO output_addresses (address, used_as_input, script_type, number_of_cjs_used_in_as_output, total_amount_received_in_cj)
-               VALUES (?, FALSE, ?::script_pubkey_type, 1, ?)""",
+            """INSERT INTO output_addresses (address, used_as_input, script_type,
+                                              number_of_cjs_used_in_as_output, total_amount_received_in_cj)
+               VALUES (from_hex(?), FALSE, ?::script_pubkey_type, 1, ?)""",
             [address, script_type, value]
         )
 
-        # Get the newly created input address with full data
+        # Get the newly created output address with full data
         result = self.conn.execute(
-            "SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type, number_of_cjs_used_in_as_output, total_amount_received_in_cj FROM output_addresses WHERE address = from_hex(?)",
+            """SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type,
+                      number_of_cjs_used_in_as_output, total_amount_received_in_cj
+               FROM output_addresses
+               WHERE address = from_hex(?)""",
             [address]
         ).fetchone()
 
-        return result
+        return OutputAddress.from_db_row(*result)
 
-    def get_coinjoin_transaction(self, tx_id) -> Dict[str,Any]:
-        pass
-    def insert_coinjoin_transaction(self, tx_data: Dict[str, Any]) -> bool: #TODO create a pydantic object for this
+    def get_coinjoin_transaction(self, tx_id: str, show_progress: Optional[str] = False) -> Optional[CoinjoinTransaction]:
+        """
+        Retrieve a CoinJoin transaction from the database by transaction ID.
+
+        Args:
+            tx_id: Transaction ID in hex string format
+
+        Returns:
+            CoinjoinTransaction object if found, None otherwise
+        """
+        # Query for existing coinjoin transaction
+        result = self.conn.execute(
+            """SELECT tx_id_int, LOWER(to_hex(tx_id)), number_inputs, number_outputs,
+                      value_inputs, value_outputs, inputs, outputs, coordinator_id,
+                      transaction_fee, block_number, block_time, raw_size_bytes,
+                      weight, fee_rate_sat_per_vbyte, processed
+               FROM coinjoin_transactions
+               WHERE tx_id = from_hex(?)""",
+            [tx_id]
+        ).fetchone()
+
+        if result:
+            # Convert DuckDB struct arrays to Pydantic models
+            inputs = TransactionInput.from_db_rows(result[6], show_progress)
+            outputs = TransactionOutput.from_db_rows(result[7], show_progress)
+
+            # Create and return CoinjoinTransaction with all fields
+            return CoinjoinTransaction.from_db_row(
+                tx_id_int=result[0],
+                tx_id=result[1],
+                number_inputs=result[2],
+                number_outputs=result[3],
+                value_inputs=result[4],
+                value_outputs=result[5],
+                inputs=inputs,
+                outputs=outputs,
+                coordinator_id=result[8],
+                transaction_fee=result[9],
+                block_number=result[10],
+                block_time=result[11],
+                raw_size_bytes=result[12],
+                weight=result[13],
+                fee_rate_sat_per_vbyte=result[14],
+                processed=result[15]
+            )
+
+        return None
+
+    def insert_coinjoin_transaction(self, tx_data: CoinjoinTransaction) -> bool:
         """
         Insert CoinJoin transaction into database.
 
         Args:
-            tx_data: Processed transaction data matching coinjoin_transactions schema
+            tx_data: CoinjoinTransaction Pydantic model with all transaction data
 
         Returns:
             True if successful, False otherwise
@@ -243,15 +345,7 @@ class DatabaseConnection:
         # TODO: Implement transaction insertion
         # Steps:
         # 1. Prepare INSERT statement for coinjoin_transactions table
-        # 2. Handle all fields from the schema:
-        #    - tx_id (BLOB)
-        #    - number_inputs, number_outputs
-        #    - value_inputs, value_outputs
-        #    - inputs (transaction_input[])
-        #    - outputs (transaction_output[])
-        #    - coordinator_id
-        #    - transaction_fee, block_number, block_time
-        #    - raw_size_bytes, weight, fee_rate_sat_per_vbyte
+        # 2. Handle all fields from the schema (tx_id, inputs, outputs, etc.)
         # 3. Execute INSERT (handle UNIQUE constraint on tx_id)
         # 4. Return success/failure status
         pass
@@ -261,13 +355,14 @@ class DatabaseConnection:
 # DATA PROCESSING
 # ============================================================================
 
+
 class TransactionProcessor:
     """Processes raw transaction data into database schema format."""
 
     @staticmethod
     def detect_script_type(scriptpubkey_type: str) -> str:
         """
-        Map API script type to database enum.
+        Map API script type to database enum value.
 
         Args:
             scriptpubkey_type: Script type from API (e.g., 'v1_p2tr', 'v0_p2wpkh')
@@ -286,138 +381,110 @@ class TransactionProcessor:
         pass
 
     @staticmethod
-    def txid_to_bytes(txid: str) -> bytes:
+    def txid_to_hex(txid: str) -> str:
         """
-        Convert transaction ID hex string to bytes.
+        Normalize transaction ID to hex string format.
 
         Args:
             txid: Transaction ID as hex string
 
         Returns:
-            Transaction ID as bytes
+            Normalized transaction ID as hex string
         """
-        # TODO: Implement txid conversion
-        # - Convert hex string to bytes
+        # TODO: Implement txid normalization
+        # - Validate hex string format
+        # - Ensure lowercase
         # - Handle potential errors
         pass
 
     @staticmethod
-    def address_to_bytes(address: str) -> bytes:
+    def process_input(vin: Dict[str, Any], input_address_id: int) -> TransactionInput:
         """
-        Convert scriptpubkey address to bytes for storage.
-
-        Args:
-            address: Bitcoin address or scriptpubkey hex
-
-        Returns:
-            Address in binary form
-        """
-        # TODO: Implement address conversion
-        # - If address is hex string, convert to bytes
-        # - Store raw scriptpubkey as bytes
-        # - Handle empty/None addresses
-        pass
-
-    @staticmethod
-    def process_input(vin: Dict[str, Any], input_address_id: int) -> Dict[str, Any]:
-        """
-        Process transaction input into transaction_input struct format.
+        Process transaction input into TransactionInput model.
 
         Args:
             vin: Raw input data from mempool API
             input_address_id: ID from input_addresses table
 
         Returns:
-            Processed input matching transaction_input struct schema
+            TransactionInput Pydantic model
         """
         # TODO: Implement input processing
-        # Required fields for transaction_input struct:
-        # - prev_tx_id: BLOB (from vin['txid'])
-        # - prev_vout_index: INTEGER (from vin['vout'])
-        # - script_pubkey_type: script_pubkey_type enum (from vin['prevout']['scriptpubkey_type'])
-        # - script_pubkey_address: BLOB (from vin['prevout']['scriptpubkey'])
-        # - input_value_satoshi: BIGINT (from vin['prevout']['value'])
-        # - is_coinbase: BOOL (from vin['is_coinbase'])
-        # - input_address_id: INTEGER (passed as parameter)
+        # Create TransactionInput from:
+        # - prev_tx_id: vin['txid']
+        # - prev_vout_index: vin['vout']
+        # - script_pubkey_type: vin['prevout']['scriptpubkey_type']
+        # - script_pubkey_address: vin['prevout']['scriptpubkey']
+        # - input_value_satoshi: vin['prevout']['value']
+        # - is_coinbase: vin.get('is_coinbase', False)
+        # - input_address_id: parameter
         pass
 
     @staticmethod
-    def process_output(vout: Dict[str, Any], output_address_id: int) -> Dict[str, Any]:
+    def process_output(vout: Dict[str, Any], vout_index: int, output_address_id: int) -> TransactionOutput:
         """
-        Process transaction output into transaction_output struct format.
+        Process transaction output into TransactionOutput model.
 
         Args:
             vout: Raw output data from mempool API
+            vout_index: Index of this output in the transaction
             output_address_id: ID from output_addresses table
 
         Returns:
-            Processed output matching transaction_output struct schema
+            TransactionOutput Pydantic model
         """
         # TODO: Implement output processing
-        # Required fields for transaction_output struct:
-        # - vout_index: INTEGER (index in vout array)
-        # - script_pubkey_type: script_pubkey_type enum (from vout['scriptpubkey_type'])
-        # - script_pubkey_address: BLOB (from vout['scriptpubkey'])
-        # - output_value_satoshi: BIGINT (from vout['value'])
-        # - output_address_id: INTEGER (passed as parameter)
+        # Create TransactionOutput from:
+        # - vout_index: parameter
+        # - script_pubkey_type: vout['scriptpubkey_type']
+        # - script_pubkey_address: vout['scriptpubkey']
+        # - output_value_satoshi: vout['value']
+        # - output_address_id: parameter
         pass
 
     @staticmethod
-    def process_transaction(tx_raw: Dict[str, Any], coordinator_id: int,
-                           db_conn: DatabaseConnection) -> Dict[str, Any]:
+    def process_transaction(
+        tx_raw: Dict[str, Any],
+        coordinator_id: int,
+        db_conn: DatabaseConnection
+    ) -> CoinjoinTransaction:
         """
-        Process raw transaction data into database schema format.
+        Process raw transaction data into CoinjoinTransaction model.
+
+        This method orchestrates the full processing pipeline:
+        1. Extract transaction metadata
+        2. Process all inputs and outputs
+        3. Update address tables
+        4. Calculate derived fields (fees, rates)
 
         Args:
             tx_raw: Raw transaction data from mempool API
             coordinator_id: Coordinator ID from database
-            db_conn: Database connection for address lookups
+            db_conn: Database connection for address operations
 
         Returns:
-            Processed transaction data ready for insertion
+            CoinjoinTransaction Pydantic model ready for insertion
         """
         # TODO: Implement full transaction processing
         # Steps:
-        # 1. Extract basic transaction info:
-        #    - tx_id: bytes (from tx_raw['txid'])
-        #    - number_inputs: len(tx_raw['vin'])
-        #    - number_outputs: len(tx_raw['vout'])
-        #
-        # 2. Process inputs:
-        #    - For each input in tx_raw['vin']:
-        #      a. Extract address and script type
-        #      b. Get/create input_address_id from database
-        #      c. Process input with process_input()
-        #    - Calculate value_inputs (sum of all input values)
-        #
-        # 3. Process outputs:
-        #    - For each output in tx_raw['vout']:
-        #      a. Extract address and script type
-        #      b. Get/create output_address_id from database
-        #      c. Process output with process_output()
-        #    - Calculate value_outputs (sum of all output values)
-        #
-        # 4. Calculate derived fields:
-        #    - transaction_fee: value_inputs - value_outputs
-        #    - fee_rate_sat_per_vbyte: fee / (weight / 4)
-        #
-        # 5. Extract block info:
-        #    - block_number: tx_raw['status']['block_height']
-        #    - block_time: tx_raw['status']['block_time'] (convert to timestamp)
-        #
-        # 6. Extract size/weight:
-        #    - raw_size_bytes: tx_raw['size']
-        #    - weight: tx_raw['weight']
-        #
-        # 7. Add coordinator_id
-        #
-        # 8. Return complete dictionary matching coinjoin_transactions schema
+        # 1. Extract basic info (txid, counts)
+        # 2. Process inputs (create InputAddress entries, build TransactionInput list)
+        # 3. Process outputs (create OutputAddress entries, build TransactionOutput list)
+        # 4. Calculate fees and rates
+        # 5. Extract block info
+        # 6. Return CoinjoinTransaction model
         pass
 
     @staticmethod
     def is_coinjoin_transaction(tx_data: Dict[str, Any]) -> bool:
         """
-        Determine if a transaction is a CoinJoin transaction.
+        Determine if a transaction is a CoinJoin transaction using heuristics.
+
+        Common CoinJoin patterns:
+        - Multiple inputs (typically >= 2)
+        - Multiple outputs (typically >= 3)
+        - Equal-valued outputs (Wasabi, Whirlpool pattern)
+        - Specific output value distributions
 
         Args:
             tx_data: Raw transaction data from API
@@ -426,12 +493,6 @@ class TransactionProcessor:
             True if transaction appears to be a CoinJoin
         """
         # TODO: Implement CoinJoin detection heuristics
-        # Common CoinJoin characteristics:
-        # 1. Multiple inputs (typically >= 2)
-        # 2. Multiple outputs (typically >= 3)
-        # 3. Equal-valued outputs (common pattern in Wasabi, Whirlpool, JoinMarket)
-        # 4. Output values follow specific patterns
-        #
         # Simple heuristic to start:
         # - Check if there are at least 2 equal-valued outputs
         # - Check if number of inputs >= 2 and outputs >= 3
@@ -442,8 +503,13 @@ class TransactionProcessor:
 # MAIN COLLECTION WORKFLOW
 # ============================================================================
 
+
 class DataCollector:
-    """Main data collection coordinator."""
+    """
+    Main data collection coordinator.
+
+    Orchestrates the collection, processing, and storage of CoinJoin transaction data.
+    """
 
     def __init__(self, coordinator_endpoint: str):
         """
@@ -452,7 +518,7 @@ class DataCollector:
         Args:
             coordinator_endpoint: CoinJoin coordinator endpoint (for tracking purposes)
         """
-        # TODO: Initialize collector
+        # TODO: Initialize collector components
         # - Store coordinator_endpoint
         # - Initialize MempoolClient
         # - Initialize DatabaseConnection
@@ -482,7 +548,7 @@ class DataCollector:
 
     def collect_transactions_batch(self, txids: List[str], show_progress: bool = True) -> Dict[str, int]:
         """
-        Collect multiple transactions in batch.
+        Collect multiple transactions in batch with progress tracking.
 
         Args:
             txids: List of transaction IDs to collect
@@ -491,61 +557,29 @@ class DataCollector:
         Returns:
             Dictionary with statistics: {'collected': N, 'skipped': M, 'errors': K}
         """
-        # TODO: Implement batch collection
-        # Steps:
-        # 1. Initialize counters for collected, skipped, errors
-        # 2. Create progress bar with tqdm:
-        #    - If show_progress: use tqdm(txids, desc="Collecting transactions")
-        #    - Otherwise: iterate normally over txids
-        # 3. For each txid:
-        #    - Try to collect_transaction()
-        #    - Update appropriate counter
-        #    - Update progress bar description with current stats
-        #    - Handle errors gracefully
-        # 4. Return statistics dictionary
-        #
-        # Example with progress bar:
-        #   stats = {'collected': 0, 'skipped': 0, 'errors': 0}
-        #   iterator = tqdm(txids, desc="Collecting") if show_progress else txids
-        #   for txid in iterator:
-        #       try:
-        #           success = self.collect_transaction(txid)
-        #           if success:
-        #               stats['collected'] += 1
-        #           else:
-        #               stats['skipped'] += 1
-        #           if show_progress:
-        #               iterator.set_postfix(collected=stats['collected'],
-        #                                    skipped=stats['skipped'],
-        #                                    errors=stats['errors'])
-        #       except Exception as e:
-        #           stats['errors'] += 1
-        #   return stats
+        # TODO: Implement batch collection with progress bar
+        # Use tqdm for progress tracking
+        # Handle errors gracefully and continue processing
         pass
 
     def collect_from_txid_list_file(self, file_path: str, show_progress: bool = True) -> Dict[str, int]:
         """
         Collect transactions from a file containing transaction IDs (one per line).
 
+        File format:
+        - One transaction ID per line
+        - Empty lines are ignored
+        - Lines starting with '#' are treated as comments
+
         Args:
             file_path: Path to file with transaction IDs
             show_progress: Whether to show progress bar (default: True)
 
         Returns:
-            Dictionary with statistics
+            Dictionary with collection statistics
         """
         # TODO: Implement file-based collection
-        # Steps:
-        # 1. Read transaction IDs from file (one per line, strip whitespace)
-        # 2. Filter out empty lines and comments (lines starting with #)
-        # 3. Call collect_transactions_batch() with the list and show_progress
-        # 4. Return statistics
-        #
-        # Example:
-        #   with open(file_path, 'r') as f:
-        #       txids = [line.strip() for line in f
-        #                if line.strip() and not line.strip().startswith('#')]
-        #   return self.collect_transactions_batch(txids, show_progress=show_progress)
+        # Read file, parse transaction IDs, call collect_transactions_batch()
         pass
 
 
@@ -553,27 +587,16 @@ class DataCollector:
 # CLI INTERFACE
 # ============================================================================
 
+
 def main():
-    """Main entry point for the data collection script."""
-    # TODO: Implement CLI
-    # Arguments needed:
-    # - coordinator_endpoint: Name/URL of coordinator for tracking
-    # - mode: 'single', 'batch', 'file'
-    # - input: txid, list of txids, or file path
-    #
-    # Example usage:
-    # python cj_tx_data_collection.py --coordinator "wasabi" --mode single --txid abc123...
-    # python cj_tx_data_collection.py --coordinator "wasabi" --mode file --input txids.txt
-    #
-    # Steps:
-    # 1. Parse command line arguments (use argparse)
-    # 2. Initialize DataCollector with coordinator_endpoint
-    # 3. Based on mode:
-    #    - single: call collect_transaction()
-    #    - batch: call collect_transactions_batch()
-    #    - file: call collect_from_txid_list_file()
-    # 4. Print summary statistics
-    # 5. Handle errors and provide meaningful error messages
+    """
+    Main entry point for the data collection script.
+
+    Provides CLI interface for collecting CoinJoin transaction data.
+    """
+    # TODO: Implement CLI with argparse
+    # Support modes: single transaction, batch, file
+    # Display statistics and handle errors
     pass
 
 

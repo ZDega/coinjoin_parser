@@ -57,7 +57,7 @@ def create_database_datagathering():
                 script_pubkey_address BLOB,
                 input_value_satoshi BIGINT,
                 is_coinbase BOOL,
-                input_address_id INTEGER
+                input_address_id INTEGER                        -- internal ordering reference to input_addresses table
             )
         """)
         print("✅ transaction_input struct created successfully")
@@ -82,7 +82,7 @@ def create_database_datagathering():
                 script_pubkey_type script_pubkey_type,
                 script_pubkey_address BLOB,
                 output_value_satoshi BIGINT,
-                output_address_id INTEGER
+                output_address_id INTEGER                       -- internal ordering reference to output_addresses table
             )
         """)
         print("✅ transaction_output struct created successfully")
