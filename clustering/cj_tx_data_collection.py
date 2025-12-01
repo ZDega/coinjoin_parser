@@ -342,13 +342,45 @@ class DatabaseConnection:
         Returns:
             True if successful, False otherwise
         """
-        # TODO: Implement transaction insertion
-        # Steps:
-        # 1. Prepare INSERT statement for coinjoin_transactions table
-        # 2. Handle all fields from the schema (tx_id, inputs, outputs, etc.)
-        # 3. Execute INSERT (handle UNIQUE constraint on tx_id)
-        # 4. Return success/failure status
-        pass
+        try:
+            # Convert Pydantic model to DuckDB-compatible format
+            db_data = CoinjoinTransaction.from_object_to_db(tx_data)
+
+            # Insert transaction into database
+            self.conn.execute(
+                """INSERT INTO coinjoin_transactions (
+                    tx_id, number_inputs, number_outputs, value_inputs, value_outputs,
+                    inputs, outputs, coordinator_id, transaction_fee, block_number,
+                    block_time, raw_size_bytes, weight, fee_rate_sat_per_vbyte, processed
+                ) VALUES (
+                    ?, ?, ?, ?, ?,
+                    ?::transaction_input[], ?::transaction_output[], ?, ?, ?,
+                    ?, ?, ?, ?, ?
+                )""",
+                [
+                    db_data["tx_id"],
+                    db_data["number_inputs"],
+                    db_data["number_outputs"],
+                    db_data["value_inputs"],
+                    db_data["value_outputs"],
+                    db_data["inputs"],
+                    db_data["outputs"],
+                    db_data["coordinator_id"],
+                    db_data["transaction_fee"],
+                    db_data["block_number"],
+                    db_data["block_time"],
+                    db_data["raw_size_bytes"],
+                    db_data["weight"],
+                    db_data["fee_rate_sat_per_vbyte"],
+                    db_data["processed"]
+                ]
+            )
+            return True
+
+        except Exception as e: #TODO comprehensive error handling
+            # Handle duplicate key or other database errors
+            print(f"Error inserting transaction {tx_data.tx_id}: {e}")
+            return False
 
 
 # ============================================================================
