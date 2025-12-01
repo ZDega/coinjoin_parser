@@ -19,6 +19,14 @@ from models.coinjoin_data import (
     CoinjoinTransaction,
 )
 
+from models.coinjoin_data_collection import (
+    # Database connection
+    DatabaseConnection,
+
+    # Transaction processing
+    TransactionProcessor,
+)
+
 __all__ = [
     # Enums
     "ScriptPubkeyType",
@@ -32,4 +40,10 @@ __all__ = [
     "InputAddress",
     "OutputAddress",
     "CoinjoinTransaction",
+
+    # Database connection
+    "DatabaseConnection",
+
+    # Transaction processing
+    "TransactionProcessor",
 ]

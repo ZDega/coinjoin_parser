@@ -30,5 +30,3 @@ print("-" * 80)
 print(f"Total Inputs:    {len(tx['vin'])}")
 print(f"Total Outputs:   {len(tx['vout'])}")
 print("=" * 80)
-
-
