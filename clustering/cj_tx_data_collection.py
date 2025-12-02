@@ -23,6 +23,8 @@ from models import (
     InputAddress,
     OutputAddress,
     CoinjoinTransaction,
+    DatabaseConnection,
+    TransactionProcessor,
 )
 
 load_dotenv()
@@ -31,85 +33,30 @@ load_dotenv()
 # ============================================================================
 # MAIN COLLECTION WORKFLOW
 # ============================================================================
+def process_coinjoins_for_scripttype() -> bool:
 
 
-class DataCollector:
-    """
-    Main data collection coordinator.
+    with DatabaseConnection() as db_conn:
+        coinjoin_transactions = db_conn.conn.execute("""SELECT to_hex(tx_id), coordinator_endpoint
+                                                        FROM raw_round_data
+                                                        WHERE processed = FALSE;
+                                                    """).fetchall()
+        mempool_client = MempoolClient()
+        total_transactions = len(coinjoin_transactions)
 
-    Orchestrates the collection, processing, and storage of CoinJoin transaction data.
-    """
+        for tx_id, coordinator_endpoint in tqdm(coinjoin_transactions, desc=f"Processing {total_transactions} unprocessed CoinJoin transactions"):
+            tx_id: str
+            coordinator_endpoint: str
 
-    def __init__(self, coordinator_endpoint: str):
-        """
-        Initialize data collector.
+            raw_transation_data = mempool_client.get_transaction(tx_id)
 
-        Args:
-            coordinator_endpoint: CoinJoin coordinator endpoint (for tracking purposes)
-        """
-        # TODO: Initialize collector components
-        # - Store coordinator_endpoint
-        # - Initialize MempoolClient
-        # - Initialize DatabaseConnection
-        # - Initialize TransactionProcessor
-        pass
+            coor_id = db_conn.get_or_create_coordinator_id(coordinator_endpoint=coordinator_endpoint)
 
-    def collect_transaction(self, txid: str) -> bool:
-        """
-        Collect and store a single transaction.
+            cj_tx = TransactionProcessor.process_transaction(tx_raw=raw_transation_data, coordinator_id=coor_id, db_conn=db_conn)
 
-        Args:
-            txid: Transaction ID to collect
+            #TODO add execute statement for cj_tx processed update to TRUE
 
-        Returns:
-            True if successful, False otherwise
-        """
-        # TODO: Implement single transaction collection
-        # Steps:
-        # 1. Fetch transaction using mempool_client.get_transaction(txid)
-        # 2. Check if it's a CoinJoin using TransactionProcessor.is_coinjoin_transaction()
-        # 3. If not CoinJoin, return False
-        # 4. Get/create coordinator_id from database
-        # 5. Process transaction using TransactionProcessor.process_transaction()
-        # 6. Insert into database using db_conn.insert_coinjoin_transaction()
-        # 7. Return success status
-        pass
 
-    def collect_transactions_batch(self, txids: List[str], show_progress: bool = True) -> Dict[str, int]:
-        """
-        Collect multiple transactions in batch with progress tracking.
-
-        Args:
-            txids: List of transaction IDs to collect
-            show_progress: Whether to show progress bar (default: True)
-
-        Returns:
-            Dictionary with statistics: {'collected': N, 'skipped': M, 'errors': K}
-        """
-        # TODO: Implement batch collection with progress bar
-        # Use tqdm for progress tracking
-        # Handle errors gracefully and continue processing
-        pass
-
-    def collect_from_txid_list_file(self, file_path: str, show_progress: bool = True) -> Dict[str, int]:
-        """
-        Collect transactions from a file containing transaction IDs (one per line).
-
-        File format:
-        - One transaction ID per line
-        - Empty lines are ignored
-        - Lines starting with '#' are treated as comments
-
-        Args:
-            file_path: Path to file with transaction IDs
-            show_progress: Whether to show progress bar (default: True)
-
-        Returns:
-            Dictionary with collection statistics
-        """
-        # TODO: Implement file-based collection
-        # Read file, parse transaction IDs, call collect_transactions_batch()
-        pass
 
 
 # ============================================================================

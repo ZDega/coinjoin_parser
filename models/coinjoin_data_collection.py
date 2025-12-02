@@ -15,7 +15,7 @@ from tqdm import tqdm
 from api_clients.mempool_client import MempoolClient
 
 # Import Pydantic models
-from models import (
+from models.coinjoin_data import (
     ScriptPubkeyType,
     TransactionInput,
     TransactionOutput,
