@@ -42,7 +42,8 @@ def ensure_table_exists(con:duckdb.DuckDBPyConnection)->bool:
                     total_output_amount BIGINT CHECK(total_output_amount >= 0),
                     change_output_ratio DOUBLE,
                     average_standard_output_anon_set DOUBLE,
-                    total_left_overs INTEGER CHECK(total_left_overs >= 0)
+                    total_left_overs INTEGER CHECK(total_left_overs >= 0),
+                    processed BOOLEAN NOT NULL DEFAULT FALSE
                      )
                     """)
         return True
@@ -96,7 +97,13 @@ def fill_data_base(con:duckdb.DuckDBPyConnection, data_file:str)->bool:
 
     return True
 
-print(DB_PATH)
-con = duckdb.connect(DB_PATH)
-print(ensure_table_exists(con))
-print(fill_data_base(con,JSON_DIR))
+
+
+if __name__ == "__main__":
+    # only run when you execute this file directly: `python inset_raw_round_data_in_db.py`
+    print(DB_PATH)
+    con = duckdb.connect(DB_PATH)
+    print(ensure_table_exists(con))
+    print(fill_data_base(con,JSON_DIR))
+
+

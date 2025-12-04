@@ -7,9 +7,9 @@ import time
 
 load_dotenv()
 MEMPOOL_BASE_URL = os.getenv("MEMPOOL_BASE_URL")
-RATE_LIMIT = os.getenv("MEMPOOL_RATE_LIMIT")
-RATE_LIMIT_INTERVAL = os.getenv("MEMPOOL_RATE_LIMIT_INTERVAL")
-MAX_RETRIES = os.getenv("MAX_RETRIES")
+RATE_LIMIT = int(os.getenv("MEMPOOL_RATE_LIMIT"))
+RATE_LIMIT_INTERVAL = int(os.getenv("MEMPOOL_RATE_LIMIT_INTERVAL"))
+MAX_RETRIES = int(os.getenv("MEMPOOL_MAX_RETRIES"))
 
 class MempoolClient:
     """Client for Mempool.space API.

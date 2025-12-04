@@ -4,18 +4,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def create_database_datagathering():
-    """Create DuckDB database with script_type enum."""
+def init_database_schema(conn: duckdb.DuckDBPyConnection):
+    """
+    Initialize all custom types, sequences, and tables on the given connection.
 
-    # Get the database path
-    db_path = os.getenv("CLUSTERING_DATABASE_PATH")
-
-    # Create new database
+    This is reusable both in production (file-based DB) and in tests (in-memory).
+    """
     print("=" * 80)
-    print(f"📊 INITIALIZING DATABASE")
+    print("📊 INITIALIZING DATABASE SCHEMA")
     print("=" * 80)
-    print(f"📁 Database path: {db_path}\n")
-    conn = duckdb.connect(db_path)
 
     print("-" * 80)
     print("🔧 STEP 1: Creating Custom Types")
@@ -54,7 +51,7 @@ def create_database_datagathering():
                 prev_tx_id BLOB,
                 prev_vout_index INTEGER,
                 script_pubkey_type script_pubkey_type,
-                script_pubkey_address BLOB,
+                script_pubkey_address TEXT, 
                 input_value_satoshi BIGINT,
                 is_coinbase BOOL,
                 input_address_id INTEGER                        -- internal ordering reference to input_addresses table
@@ -80,7 +77,7 @@ def create_database_datagathering():
             CREATE TYPE IF NOT EXISTS transaction_output AS STRUCT (
                 vout_index INTEGER,
                 script_pubkey_type script_pubkey_type,
-                script_pubkey_address BLOB,
+                script_pubkey_address TEXT,
                 output_value_satoshi BIGINT,
                 output_address_id INTEGER                       -- internal ordering reference to output_addresses table
             )
@@ -116,6 +113,43 @@ def create_database_datagathering():
     print("🔧 STEP 3: Creating Tables")
     print("-" * 80)
 
+
+    try:
+        # Create coordinator table
+        print("🚀 Creating raw_round_data table...")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS raw_round_data (
+                    coordinator_endpoint TEXT NOT NULL,
+                    estimated_coordinator_earnings_sats INTEGER CHECK(estimated_coordinator_earnings_sats >= 0),
+                    round_id BLOB PRIMARY KEY ,
+                    isBlame BOOLEAN,
+                    coordinaton_fee_rate DOUBLE,
+                    min_input_count INTEGER CHECK(min_input_count >= 0),
+                    parameters_mining_fee_rate DOUBLE,
+                    round_start_time TIMESTAMP,
+                    round_end_time TIMESTAMP,
+                    tx_id BLOB ,
+                    final_mining_fee_rate DOUBLE,
+                    virtual_size DOUBLE,
+                    total_mining_fee DOUBLE,
+                    input_count INTEGER CHECK(input_count >= 0),
+                    total_input_amount BIGINT CHECK(total_input_amount >= 0),
+                    fresh_inputs_estimate_btc DOUBLE,
+                    average_standard_input_anon_set DOUBLE,
+                    output_count INTEGER CHECK(output_count >= 0),
+                    total_output_amount BIGINT CHECK(total_output_amount >= 0),
+                    change_output_ratio DOUBLE,
+                    average_standard_output_anon_set DOUBLE,
+                    total_left_overs INTEGER CHECK(total_left_overs >= 0),
+                    processed BOOLEAN NOT NULL DEFAULT FALSE
+                     )
+                    """)
+        print("✅ Raw_round_data table created successfully\n")
+
+    except Exception as e:
+        print(f"❌ Error creating raw_round_data table: {e}")
+        raise
+    
     try:
         # Create coordinator table
         print("🚀 Creating coordinators table...")
@@ -194,7 +228,7 @@ def create_database_datagathering():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS input_addresses (
                 input_address_id INTEGER PRIMARY KEY DEFAULT nextval('input_id_seq'),
-                address BLOB UNIQUE,                        -- scriptpubkey_address in binary form
+                address TEXT UNIQUE,                        -- scriptpubkey_address in binary form
                 used_as_output BOOLEAN,                     -- true if this address also appears as CJ output
                 script_type script_pubkey_type,
                 number_of_cjs_used_in_as_input INTEGER,
@@ -223,7 +257,7 @@ def create_database_datagathering():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS output_addresses (
                 output_address_id INTEGER PRIMARY KEY DEFAULT nextval('output_id_seq'),
-                address BLOB UNIQUE,                        -- scriptpubkey_address in binary form
+                address TEXT UNIQUE,                        -- scriptpubkey_address in binary form
                 used_as_input BOOLEAN,                      -- true if this address also appears as CJ input
                 script_type script_pubkey_type,
                 number_of_cjs_used_in_as_output INTEGER,
@@ -236,12 +270,27 @@ def create_database_datagathering():
         print(f"❌ Error creating output_addresses table: {e}")
         raise
 
-    finally:
-        conn.close()
+
+def create_database_datagathering(db_path: str | None = None) -> None:
+    """Create DuckDB database file (production use)."""
+    if db_path is None:
+        db_path = os.getenv("CLUSTERING_DATABASE_PATH")
+
+    print("=" * 80)
+    print("📊 INITIALIZING DATABASE")
+    print("=" * 80)
+    print(f"📁 Database path: {db_path}\n")
+
+    conn = duckdb.connect(db_path)
+
+    try:
+        init_database_schema(conn)
         print("=" * 80)
         print("🎉 DATABASE SETUP COMPLETED SUCCESSFULLY")
         print("=" * 80)
         print(f"📁 Database location: {db_path}\n")
+    finally:
+        conn.close()
 
 if __name__ == "__main__":
     create_database_datagathering()
