@@ -103,10 +103,7 @@ def main():
 
     Provides CLI interface for collecting CoinJoin transaction data.
     """
-    # TODO: Implement CLI with argparse
-    # Support modes: single transaction, batch, file
-    # Display statistics and handle errors
-    pass
+    process_coinjoins_for_scripttype()
 
 
 if __name__ == "__main__":
