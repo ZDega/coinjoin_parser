@@ -7,7 +7,7 @@ These models correspond to the DuckDB schema defined in data/create_data_base.py
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from enum import Enum
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 from tqdm import tqdm
 
 
@@ -140,14 +140,15 @@ class TransactionInput(BaseModel):
         return {
             "prev_tx_id": bytes.fromhex(input.prev_tx_id),
             "prev_vout_index": input.prev_vout_index,
-            "script_pubkey_type": input.script_pubkey_type.value,
-            "script_pubkey_address": bytes.fromhex(input.script_pubkey_address),
+            "script_pubkey_type": input.script_pubkey_type,
+            "script_pubkey_address": input.script_pubkey_address,
             "input_value_satoshi": input.input_value_satoshi,
             "is_coinbase": input.is_coinbase,
             "input_address_id": input.input_address_id
         }
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(
+        use_enum_values=True
+    )
 
 
 class TransactionOutput(BaseModel):
@@ -251,12 +252,13 @@ class TransactionOutput(BaseModel):
         return {
             "vout_index": output.vout_index,
             "script_pubkey_type": output.script_pubkey_type,
-            "script_pubkey_address": bytes.fromhex(output.script_pubkey_address),
+            "script_pubkey_address": output.script_pubkey_address,
             "output_value_satoshi": output.output_value_satoshi,
             "output_address_id": output.output_address_id
         }
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(
+        use_enum_values=True
+    )
 
 
 # ============================================================================
@@ -293,8 +295,9 @@ class Coordinator(BaseModel):
             coordinator_endpoint=coordinator_endpoint
         )
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(
+        from_attributes=True
+    )
 
 
 class InputAddress(BaseModel):
@@ -352,9 +355,10 @@ class InputAddress(BaseModel):
             total_amount_spent_in_cj=total_amount_spend_in_cj
         )
 
-    class Config:
-        from_attributes = True
-        use_enum_values = True
+    model_config = ConfigDict(
+        from_attributes=True,
+        use_enum_values=True
+    )
 
 
 class OutputAddress(BaseModel):
@@ -412,9 +416,10 @@ class OutputAddress(BaseModel):
             total_amount_received_in_cj=total_amount_received_in_cj
         )
 
-    class Config:
-        from_attributes = True
-        use_enum_values = True
+    model_config = ConfigDict(
+        from_attributes=True,
+        use_enum_values=True
+    )
 
 
 class CoinjoinTransaction(BaseModel):
@@ -604,6 +609,7 @@ class CoinjoinTransaction(BaseModel):
             "fee_rate_sat_per_vbyte": coinjoin_transaction.fee_rate_sat_per_vbyte,
             "processed": coinjoin_transaction.processed
         }
-    class Config:
-        from_attributes = True
-        use_enum_values = True
+    model_config = ConfigDict(
+        from_attributes=True,
+        use_enum_values=True
+    )
