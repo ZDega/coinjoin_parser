@@ -138,7 +138,7 @@ class DatabaseConnection:
 
         # Query for existing input address
         result = self.conn.execute(
-            """SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type,
+            """SELECT input_address_id, address, used_as_output, script_type,
                       number_of_cjs_used_in_as_input, total_amount_spent_in_cj
                FROM input_addresses
                WHERE address = ?""",
@@ -175,7 +175,7 @@ class DatabaseConnection:
 
         # Query for existing output address
         result = self.conn.execute(
-            """SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type,
+            """SELECT output_address_id, address, used_as_input, script_type,
                       number_of_cjs_used_in_as_output, total_amount_received_in_cj
                FROM output_addresses
                WHERE address = ?""",
@@ -194,7 +194,7 @@ class DatabaseConnection:
 
         return None
 
-    def update_or_insert_input_address(self, address: str, script_type: str, value: int) -> InputAddress:
+    def update_or_insert_input_address(self, address: str, script_type: str, value: int, used_as_output: bool) -> InputAddress:
         """
         Update existing input address statistics or create new entry if it doesn't exist.
 
@@ -205,22 +205,27 @@ class DatabaseConnection:
             address: Script pubkey address (Bitcoin address format)
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
             value: Input value in satoshis to add to total_amount_spent_in_cj
+            used_as_output: Boolean indicating if this address has been used as an output address
 
         Returns:
             InputAddress object with updated values
         """
         # Check if input address already exists
         result = self.get_input_address(address, script_type)
+        if result and result.input_address_id == 1:
+            print(result)
 
         if result:
             # Address exists, update statistics in database
             self.conn.execute(
                 """UPDATE input_addresses
                    SET number_of_cjs_used_in_as_input = number_of_cjs_used_in_as_input + 1,
-                       total_amount_spent_in_cj = total_amount_spent_in_cj + ?
+                        total_amount_spent_in_cj = total_amount_spent_in_cj + ?,
+                        used_as_output = ?
                    WHERE input_address_id = ?""",
-                [value, result.input_address_id]
+                [value, used_as_output, result.input_address_id]
             )
+            print(result.number_of_cjs_used_in_as_input + 1)
             print(f"    📝 Updated input address {address[:16]}... (ID: {result.input_address_id})")
             # Return new object with updated values
             return InputAddress.from_db_row(
@@ -239,13 +244,13 @@ class DatabaseConnection:
         self.conn.execute(
             """INSERT INTO input_addresses (address, used_as_output, script_type,
                                              number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
-               VALUES (?, FALSE, ?::script_pubkey_type, 1, ?)""",
-            [address, script_type, value]
+               VALUES (?, ?, ?::script_pubkey_type, 1, ?)""",
+            [address, used_as_output, script_type, value]
         )
 
         # Get the newly created input address with full data
         result = self.conn.execute(
-            """SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type,
+            """SELECT input_address_id, address, used_as_output, script_type,
                       number_of_cjs_used_in_as_input, total_amount_spent_in_cj
                FROM input_addresses
                WHERE address = ?""",
@@ -255,7 +260,7 @@ class DatabaseConnection:
         #print(f"    ✅ Created new input address with ID: {result[0]}")
         return InputAddress.from_db_row(*result)
 
-    def update_or_insert_output_address(self, address: str, script_type: str, value: int) -> OutputAddress:
+    def update_or_insert_output_address(self, address: str, script_type: str, value: int, used_as_input: bool) -> OutputAddress:
         """
         Update existing output address statistics or create new entry if it doesn't exist.
 
@@ -266,6 +271,7 @@ class DatabaseConnection:
             address: Script pubkey address (Bitcoin address format)
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
             value: Output value in satoshis to add to total_amount_received_in_cj
+            used_as_input: Boolean indicating if this address has been used as an input address
 
         Returns:
             OutputAddress object with updated values
@@ -278,9 +284,10 @@ class DatabaseConnection:
             self.conn.execute(
                 """UPDATE output_addresses
                    SET number_of_cjs_used_in_as_output = number_of_cjs_used_in_as_output + 1,
-                       total_amount_received_in_cj = total_amount_received_in_cj + ?
+                    total_amount_received_in_cj = total_amount_received_in_cj + ?,
+                    used_as_input = ?
                    WHERE output_address_id = ?""",
-                [value, result.output_address_id]
+                [value, used_as_input, result.output_address_id]
             )
             print(f"    📝 Updated output address {address[:16]}... (ID: {result.output_address_id})")
             # Return new object with updated values
@@ -299,13 +306,13 @@ class DatabaseConnection:
         self.conn.execute(
             """INSERT INTO output_addresses (address, used_as_input, script_type,
                                               number_of_cjs_used_in_as_output, total_amount_received_in_cj)
-               VALUES (?, FALSE, ?::script_pubkey_type, 1, ?)""",
-            [address, script_type, value]
+               VALUES (?, ?, ?::script_pubkey_type, 1, ?)""",
+            [address, used_as_input, script_type, value]
         )
 
         # Get the newly created output address with full data
         result = self.conn.execute(
-            """SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type,
+            """SELECT output_address_id, address, used_as_input, script_type,
                       number_of_cjs_used_in_as_output, total_amount_received_in_cj
                FROM output_addresses
                WHERE address = ?""",
@@ -314,7 +321,75 @@ class DatabaseConnection:
 
         #print(f"    ✅ Created new output address with ID: {result[0]}")
         return OutputAddress.from_db_row(*result)
+    
+    def check_input_is_also_output_update_output(self, address: str) -> bool:
+        """
+        Check if an input address is also used as an output address,
+        and update the used_as_input flag in output_addresses table if necessary.
 
+        Args:
+            address: Script pubkey address (Bitcoin address format)
+        Returns:
+            True if the address is found and updated, False otherwise
+            Also updates the used_as_input flag in output_addresses table if necessary.
+        """
+        # Check if the address exists in output_addresses
+        result = self.conn.execute(
+            """SELECT output_address_id, used_as_input
+               FROM output_addresses
+               WHERE address = ?""",
+            [address]
+        ).fetchone()
+
+        if result:
+            output_address_id, used_as_input = result
+            if not used_as_input:
+                # Update the used_as_input flag to True
+                self.conn.execute(
+                    """UPDATE output_addresses
+                       SET used_as_input = TRUE
+                       WHERE output_address_id = ?""",
+                    [output_address_id]
+                )
+                print(f"    🔄 Updated output address {address[:16]}... (ID: {output_address_id}) to mark as used as input")
+            return True
+
+        return False
+    
+    def check_output_is_also_input_update_input(self, address: str) -> bool:
+        """
+        Check if an output address is also used as an input address,
+        and update the used_as_output flag in input_addresses table if necessary.
+
+        Args:
+            address: Script pubkey address (Bitcoin address format)
+        Returns:
+            True if the address is found and updated, False otherwise
+            Also updates the used_as_output flag in input_addresses table if necessary.
+        """
+        # Check if the address exists in input_addresses
+        result = self.conn.execute(
+            """SELECT input_address_id, used_as_output
+               FROM input_addresses
+               WHERE address = ?""",
+            [address]
+        ).fetchone()
+
+        if result:
+            input_address_id, used_as_output = result
+            if not used_as_output:
+                # Update the used_as_output flag to True
+                self.conn.execute(
+                    """UPDATE input_addresses
+                       SET used_as_output = TRUE
+                       WHERE input_address_id = ?""",
+                    [input_address_id]
+                )
+                print(f"    🔄 Updated input address {address[:16]}... (ID: {input_address_id}) to mark as used as output")
+            return True
+
+        return False
+    
     def get_coinjoin_transaction(self, tx_id: str, show_progress: Optional[str] = False) -> Optional[CoinjoinTransaction]:
         """
         Retrieve a CoinJoin transaction from the database by transaction ID.
@@ -576,7 +651,6 @@ class TransactionProcessor:
         """
         # Step 1: Extract and normalize basic transaction info
         txid = TransactionProcessor.txid_to_hex(tx_raw['txid'])
-
         # Step 2: Process inputs - update/insert addresses and create TransactionInput objects
         processed_inputs = []
         total_input_value = 0
@@ -589,19 +663,21 @@ class TransactionProcessor:
             address = vin['prevout']['scriptpubkey_address']
             value = vin['prevout']['value']
 
+            # Check if input address is also used as output and update flag
+            used_as_output = db_conn.check_input_is_also_output_update_output(address)
+
             # Update or insert input address and get ID
             input_address = db_conn.update_or_insert_input_address(
                 address=address,
                 script_type=script_type,
-                value=value
+                value=value,
+                used_as_output=used_as_output
             )
-
             # Process input into TransactionInput model
             tx_input = TransactionProcessor.process_input(
                 vin=vin,
                 input_address_id=input_address.input_address_id
             )
-
             processed_inputs.append(tx_input)
             total_input_value += value
 
@@ -617,20 +693,22 @@ class TransactionProcessor:
             address = vout['scriptpubkey_address']
             value = vout['value']
 
+            # Check if output address is also used as input and update flag
+            used_as_input = db_conn.check_output_is_also_input_update_input(address)
+
             # Update or insert output address and get ID
             output_address = db_conn.update_or_insert_output_address(
                 address=address,
                 script_type=script_type,
-                value=value
+                value=value,
+                used_as_input=used_as_input
             )
-
             # Process output into TransactionOutput model
             tx_output = TransactionProcessor.process_output(
                 vout=vout,
                 vout_index=vout_index,
                 output_address_id=output_address.output_address_id
             )
-
             processed_outputs.append(tx_output)
             total_output_value += value
 
@@ -647,7 +725,7 @@ class TransactionProcessor:
         from datetime import datetime
         block_number = tx_raw['status']['block_height']
         block_time = datetime.fromtimestamp(tx_raw['status']['block_time'])
-
+        
         # Step 6: Create and return CoinjoinTransaction model
         return CoinjoinTransaction(
             tx_id=txid,
