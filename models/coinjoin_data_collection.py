@@ -36,23 +36,38 @@ load_dotenv()
 class DatabaseConnection:
     """Manages DuckDB database connection and operations."""
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(self, db_path: Optional[str] = None, db_memory: bool = False, connection: Optional[duckdb.DuckDBPyConnection] = None):
         """
         Initialize database connection.
 
         Args:
             db_path: Path to DuckDB database. If None, uses CLUSTERING_DATABASE_PATH env var.
+            db_memory: If True, creates an in-memory database (overrides db_path).
+            connection: Existing DuckDB connection to reuse. If provided, db_path and db_memory are ignored.
         """
-        self.db_path = db_path or os.getenv("CLUSTERING_DATABASE_PATH")
-        self.conn = duckdb.connect(self.db_path)
+        if connection is not None:
+            # Use existing connection
+            self.conn = connection
+            self.db_path = None
+            self._owns_connection = False
+        elif db_memory:
+            # Create in-memory database
+            self.conn = duckdb.connect(":memory:")
+            self.db_path = ":memory:"
+            self._owns_connection = True
+        else:
+            # Use provided path or fall back to environment variable
+            self.db_path = db_path or os.getenv("CLUSTERING_DATABASE_PATH")
+            self.conn = duckdb.connect(self.db_path)
+            self._owns_connection = True
 
     def __enter__(self) -> "DatabaseConnection":
         """Context manager entry."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
-        """Context manager exit - close connection."""
-        if self.conn:
+        """Context manager exit - close connection only if we own it."""
+        if self.conn and self._owns_connection:
             self.conn.close()
         return False  # Don't suppress exceptions - let them propagate
 
@@ -74,6 +89,7 @@ class DatabaseConnection:
 
         if result:
             # Coordinator exists, return as Coordinator object
+            print(f"  🔗 Found existing coordinator (ID: {result[0]})")
             return Coordinator.from_db_row(*result)
 
         # Coordinator doesn't exist, create new entry
@@ -88,6 +104,7 @@ class DatabaseConnection:
             [coordinator_endpoint]
         ).fetchone()
 
+        print(f"  ➕ Created new coordinator (ID: {result[0]})")
         return Coordinator.from_db_row(*result)
 
     def get_or_create_coordinator_id(self, coordinator_endpoint: str) -> int:
@@ -107,7 +124,7 @@ class DatabaseConnection:
         Get input address from database if it exists.
 
         Args:
-            address: Script pubkey address in hex string form
+            address: Script pubkey address (Bitcoin address format)
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
 
         Returns:
@@ -116,12 +133,15 @@ class DatabaseConnection:
         Raises:
             ValueError: If the stored script_type doesn't match the provided script_type
         """
+        
+        
+
         # Query for existing input address
         result = self.conn.execute(
             """SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type,
                       number_of_cjs_used_in_as_input, total_amount_spent_in_cj
                FROM input_addresses
-               WHERE address = from_hex(?)""",
+               WHERE address = ?""",
             [address]
         ).fetchone()
 
@@ -142,7 +162,7 @@ class DatabaseConnection:
         Get output address from database if it exists.
 
         Args:
-            address: Script pubkey address in hex string form
+            address: Script pubkey address (Bitcoin address format)
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
 
         Returns:
@@ -151,12 +171,14 @@ class DatabaseConnection:
         Raises:
             ValueError: If the stored script_type doesn't match the provided script_type
         """
+        
+
         # Query for existing output address
         result = self.conn.execute(
             """SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type,
                       number_of_cjs_used_in_as_output, total_amount_received_in_cj
                FROM output_addresses
-               WHERE address = from_hex(?)""",
+               WHERE address = ?""",
             [address]
         ).fetchone()
 
@@ -180,7 +202,7 @@ class DatabaseConnection:
         used as inputs in CoinJoin transactions.
 
         Args:
-            address: Script pubkey address in hex string form
+            address: Script pubkey address (Bitcoin address format)
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
             value: Input value in satoshis to add to total_amount_spent_in_cj
 
@@ -199,21 +221,25 @@ class DatabaseConnection:
                    WHERE input_address_id = ?""",
                 [value, result.input_address_id]
             )
+            print(f"    📝 Updated input address {address[:16]}... (ID: {result.input_address_id})")
             # Return new object with updated values
             return InputAddress.from_db_row(
                 result.input_address_id,
                 result.address,
                 result.used_as_output,
-                result.script_type.value,
+                result.script_type,
                 result.number_of_cjs_used_in_as_input + 1,
                 result.total_amount_spent_in_cj + value
             )
 
         # Address doesn't exist, create new entry
+        #print(f"    ➕ Inserting new input address {address[:16]}... into input_addresses table")
+        
+        
         self.conn.execute(
             """INSERT INTO input_addresses (address, used_as_output, script_type,
                                              number_of_cjs_used_in_as_input, total_amount_spent_in_cj)
-               VALUES (from_hex(?), FALSE, ?::script_pubkey_type, 1, ?)""",
+               VALUES (?, FALSE, ?::script_pubkey_type, 1, ?)""",
             [address, script_type, value]
         )
 
@@ -222,10 +248,11 @@ class DatabaseConnection:
             """SELECT input_address_id, LOWER(to_hex(address)), used_as_output, script_type,
                       number_of_cjs_used_in_as_input, total_amount_spent_in_cj
                FROM input_addresses
-               WHERE address = from_hex(?)""",
+               WHERE address = ?""",
             [address]
         ).fetchone()
 
+        #print(f"    ✅ Created new input address with ID: {result[0]}")
         return InputAddress.from_db_row(*result)
 
     def update_or_insert_output_address(self, address: str, script_type: str, value: int) -> OutputAddress:
@@ -236,7 +263,7 @@ class DatabaseConnection:
         used as outputs in CoinJoin transactions.
 
         Args:
-            address: Script pubkey address in hex string form
+            address: Script pubkey address (Bitcoin address format)
             script_type: Script pubkey type (p2pkh, p2sh, v0_p2wpkh, etc.)
             value: Output value in satoshis to add to total_amount_received_in_cj
 
@@ -255,21 +282,24 @@ class DatabaseConnection:
                    WHERE output_address_id = ?""",
                 [value, result.output_address_id]
             )
+            print(f"    📝 Updated output address {address[:16]}... (ID: {result.output_address_id})")
             # Return new object with updated values
             return OutputAddress.from_db_row(
                 result.output_address_id,
                 result.address,
                 result.used_as_input,
-                result.script_type.value,
+                result.script_type,
                 result.number_of_cjs_used_in_as_output + 1,
                 result.total_amount_received_in_cj + value
             )
 
         # Address doesn't exist, create new entry
+        #print(f"    ➕ Inserting new output address {address[:16]}... into output_addresses table")
+
         self.conn.execute(
             """INSERT INTO output_addresses (address, used_as_input, script_type,
                                               number_of_cjs_used_in_as_output, total_amount_received_in_cj)
-               VALUES (from_hex(?), FALSE, ?::script_pubkey_type, 1, ?)""",
+               VALUES (?, FALSE, ?::script_pubkey_type, 1, ?)""",
             [address, script_type, value]
         )
 
@@ -278,10 +308,11 @@ class DatabaseConnection:
             """SELECT output_address_id, LOWER(to_hex(address)), used_as_input, script_type,
                       number_of_cjs_used_in_as_output, total_amount_received_in_cj
                FROM output_addresses
-               WHERE address = from_hex(?)""",
+               WHERE address = ?""",
             [address]
         ).fetchone()
 
+        #print(f"    ✅ Created new output address with ID: {result[0]}")
         return OutputAddress.from_db_row(*result)
 
     def get_coinjoin_transaction(self, tx_id: str, show_progress: Optional[str] = False) -> Optional[CoinjoinTransaction]:
@@ -375,11 +406,12 @@ class DatabaseConnection:
                     db_data["processed"]
                 ]
             )
+            
             return True
 
         except Exception as e: #TODO comprehensive error handling
             # Handle duplicate key or other database errors
-            print(f"Error inserting transaction {tx_data.tx_id}: {e}")
+            print(f"  ❌ Error inserting transaction {tx_data.tx_id}: {e}")
             return False
 
 
