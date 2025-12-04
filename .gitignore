@@ -54,3 +54,4 @@ logs/
 
 #raw_data/
 raw_cj_round_data/
+*.zip
