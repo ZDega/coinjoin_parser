@@ -6,7 +6,7 @@ in the DuckDB database according to the schema defined in data/create_data_base.
 """
 
 import os
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, Optional
 from dotenv import load_dotenv
 import duckdb
 from tqdm import tqdm
@@ -59,6 +59,7 @@ class DatabaseConnection:
             # Use provided path or fall back to environment variable
             self.db_path = db_path or os.getenv("CLUSTERING_DATABASE_PATH")
             self.conn = duckdb.connect(self.db_path)
+            self.conn.execute("SET threads=1")
             self._owns_connection = True
 
     def __enter__(self) -> "DatabaseConnection":
