@@ -19,10 +19,12 @@ from models.coinjoin_data import (
     CoinjoinTransaction,
 )
 
-from models.coinjoin_data_collection import (
+from models.database_connection import (
     # Database connection
     DatabaseConnection,
+)
 
+from models.transaction_processor import (
     # Transaction processing
     TransactionProcessor,
 )
