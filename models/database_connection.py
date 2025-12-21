@@ -391,7 +391,7 @@ class DatabaseConnection:
 
         return False
     
-    def get_coinjoin_transaction(self, tx_id: str, show_progress: Optional[str] = False) -> Optional[CoinjoinTransaction]:
+    def get_coinjoin_transaction(self, tx_id: str, show_progress: Optional[bool] = False) -> Optional[CoinjoinTransaction]:
         """
         Retrieve a CoinJoin transaction from the database by transaction ID.
 

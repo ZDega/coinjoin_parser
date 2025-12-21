@@ -108,7 +108,7 @@ class TransactionInput(BaseModel):
         iterator = tqdm(rows, desc=desc) if show_progress else rows
         return [
             cls.from_db_row(
-                prev_tx_id=row['prev_tx_id'],
+                prev_tx_id=row['prev_tx_id'].hex() if isinstance(row['prev_tx_id'], bytes) else row['prev_tx_id'],
                 prev_vout_index=row['prev_vout_index'],
                 script_pubkey_type=row['script_pubkey_type'],
                 script_pubkey_address=row['script_pubkey_address'],
