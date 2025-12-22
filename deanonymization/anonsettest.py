@@ -2,6 +2,384 @@ from api_clients.mempool_client import MempoolClient
 import duckdb
 from models import DatabaseConnection
 import argparse
+from typing import Dict, Set, Tuple, List, Any
+from itertools import combinations
+
+
+def setup_phase(tx):
+    """
+    SETUP PHASE: Create sets for easy membership checking and removal
+
+    Args:
+        tx: CoinjoinTransaction object
+
+    Returns:
+        Tuple of (all_input_addresses, all_output_addresses,
+                  inputs_by_value_and_type, outputs_by_value_and_type)
+    """
+    # Create a set of all input addresses for quick lookup
+    all_input_addresses = {inp.script_pubkey_address for inp in tx.inputs}
+
+    # Create a set of all output addresses for quick lookup
+    all_output_addresses = {out.script_pubkey_address for out in tx.outputs}
+
+    # Create sets grouped by value and script type for inputs
+    inputs_by_value_and_type = {}
+    for inp in tx.inputs:
+        key = (inp.input_value_satoshi, inp.script_pubkey_type)
+        if key not in inputs_by_value_and_type:
+            inputs_by_value_and_type[key] = set()
+        inputs_by_value_and_type[key].add(inp.script_pubkey_address)
+
+    # Create sets grouped by value and script type for outputs
+    outputs_by_value_and_type = {}
+    for out in tx.outputs:
+        key = (out.output_value_satoshi, out.script_pubkey_type)
+        if key not in outputs_by_value_and_type:
+            outputs_by_value_and_type[key] = set()
+        outputs_by_value_and_type[key].add(out.script_pubkey_address)
+
+    return all_input_addresses, all_output_addresses, inputs_by_value_and_type, outputs_by_value_and_type
+
+
+def first_pass_build_anonymity_sets(tx) -> Tuple[Dict, Set, int]:
+    """
+    FIRST PASS: Build anonymity sets from outputs and track script type counts
+
+    Args:
+        tx: CoinjoinTransaction object
+
+    Returns:
+        Tuple of (anonsets, avasets, output_count)
+    """
+    output_count = 0
+    avasets = set()
+    anonsets = {}
+
+    for out in tx.outputs:
+        if out.output_value_satoshi not in avasets:
+            anonsets[str(out.output_value_satoshi)] = {
+                "outset": {out.script_pubkey_address},
+                "inset": set(),
+                "set_state": out.script_pubkey_type,
+                "anon_size": 1,
+                "output_type_counts": {out.script_pubkey_type: 1},  # Track script types in outputs
+                "input_type_counts": {},  # Track script types added as inputs
+                "inputs_added_for_distinct_outputs": {}
+            }
+            avasets.add(out.output_value_satoshi)
+            output_count += 1
+        else:
+            cur = anonsets[str(out.output_value_satoshi)]
+            outset = cur["outset"]
+            outset: set
+            outset.add(out.script_pubkey_address)
+            cur["anon_size"] += 1
+
+            # Update script type count for this output
+            if out.script_pubkey_type in cur["output_type_counts"]:
+                cur["output_type_counts"][out.script_pubkey_type] += 1
+            else:
+                cur["output_type_counts"][out.script_pubkey_type] = 1
+
+            output_count += 1
+            if cur["set_state"] != out.script_pubkey_type:
+                cur["set_state"] = "other"
+
+    return anonsets, avasets, output_count
+
+
+def second_pass_add_inputs_to_anonsets(
+    inputs_by_value_and_type: Dict,
+    avasets: Set,
+    anonsets: Dict,
+    all_input_addresses: Set
+) -> int:
+    """
+    SECOND PASS: Add inputs to anonymity sets, respecting script type distribution
+
+    Args:
+        inputs_by_value_and_type: Dictionary mapping (value, script_type) -> set of addresses
+        avasets: Set of available output values
+        anonsets: Dictionary of anonymity sets
+        all_input_addresses: Set of all input addresses (modified in-place)
+
+    Returns:
+        input_count: Number of inputs matched
+    """
+    input_count = 0
+
+    # Iterate over the grouped input sets for efficiency
+    for (value, script_type), input_addrs in inputs_by_value_and_type.items():
+        if value in avasets:
+            cur = anonsets[str(value)]
+            outset = cur["outset"]
+            inset = cur["inset"]
+            output_type_counts = cur["output_type_counts"]
+            input_type_counts = cur["input_type_counts"]
+            input_distinct_count = cur["inputs_added_for_distinct_outputs"]
+
+            # Get the count of this script type in outputs
+            output_count_for_type = output_type_counts.get(script_type, 0)
+
+            # Skip if this script type doesn't exist in outputs
+            if output_count_for_type == 0:
+                continue
+
+            # Get the count of this script type already added as inputs
+            input_count_for_type = input_type_counts.get(script_type, 0)
+            input_count_distinct_output = input_distinct_count.get(script_type, 0)
+
+            # Calculate how many more inputs of this type we can add
+            slots_available = min(
+                output_count_for_type - input_count_for_type,  # Type-specific slots
+                len(outset) - len(inset)  # Total slots in anonymity set
+            )
+
+            if slots_available > 0:
+                # Convert to list to allow removal during iteration
+                input_addrs_list = list(input_addrs)
+
+                for addr in input_addrs_list[:slots_available]:
+                    inset.add(addr)
+                    input_count += 1
+                    input_type_counts[script_type] = input_count_for_type + 1
+                    input_distinct_count[script_type] = input_count_distinct_output + 1
+
+                    # Remove from setup sets
+                    all_input_addresses.discard(addr)
+                    input_addrs.discard(addr)
+
+    return input_count
+
+
+def third_pass_divide_large_inputs(
+    tx,
+    all_input_addresses: Set,
+    inputs_by_value_and_type: Dict,
+    anonsets: Dict,
+    avasets: Set,
+    show_debug: bool = False
+) -> int:
+    """
+    THIRD PASS: Divide bigger inputs into smaller outputs
+
+    Args:
+        tx: CoinjoinTransaction object
+        all_input_addresses: Set of unmatched input addresses (modified in-place)
+        inputs_by_value_and_type: Dictionary mapping (value, script_type) -> set of addresses
+        anonsets: Dictionary of anonymity sets (modified in-place)
+        avasets: Set of available output values
+        show_debug: Whether to show debug output
+
+    Returns:
+        division_count: Number of inputs successfully divided
+    """
+    # TODO: Implement dynamic programming division algorithm
+    # This will be implemented in the next step
+    division_count = 0
+
+    if show_debug:
+        print("=" * 120)
+        print("THIRD PASS: Large Input Division (Not yet implemented)")
+        print("=" * 120)
+        print(f"Remaining unmatched inputs: {len(all_input_addresses)}")
+        print("=" * 120)
+
+    return division_count
+
+
+def fourth_pass_subset_sum_matching(
+    tx,
+    all_input_addresses: Set,
+    avasets: Set,
+    anonsets: Dict,
+    show_details: bool = False,
+    show_debug: bool = False
+) -> Tuple[Dict, Set, int]:
+    """
+    FOURTH PASS: Subset sum matching - find combinations of inputs that match output values
+
+    Args:
+        tx: CoinjoinTransaction object
+        all_input_addresses: Set of unmatched input addresses
+        avasets: Set of available output values
+        anonsets: Dictionary of anonymity sets (modified in-place)
+        show_details: Whether to show detailed output
+        show_debug: Whether to show debug output
+
+    Returns:
+        Tuple of (subset_matches, used_in_combinations, input_count)
+    """
+    if show_details:
+        print("=" * 120)
+        print("FOURTH PASS: Subset Sum Matching")
+        print("=" * 120)
+        print(f"Remaining unmatched inputs: {len(all_input_addresses)}")
+
+    # Get target output values to search for
+    target_values = sorted(avasets, reverse=True)
+    max_target_value = max(target_values) if target_values else 0
+
+    # Filter inputs - only keep those still unmatched and smaller than max output value
+    candidate_inputs = [
+        inp for inp in tx.inputs
+        if inp.script_pubkey_address in all_input_addresses
+        and inp.input_value_satoshi < max_target_value
+    ]
+
+    if show_details:
+        print(f"Candidate inputs (< max output value): {len(candidate_inputs)}")
+
+    # Configuration
+    MAX_COMBINATION_SIZE = 5
+    MIN_COMBINATION_SIZE = 2
+
+    # Track subset sum matches
+    subset_matches = {}
+    used_in_combinations = set()
+    input_count = 0
+
+    # Group candidate inputs by script type for same-type combinations
+    inputs_by_script_type = {}
+    for inp in candidate_inputs:
+        if inp.script_pubkey_type not in inputs_by_script_type:
+            inputs_by_script_type[inp.script_pubkey_type] = []
+        inputs_by_script_type[inp.script_pubkey_type].append(inp)
+
+    if show_details:
+        print(f"Input groups by script type: {[(st, len(inps)) for st, inps in inputs_by_script_type.items()]}")
+        print()
+
+    # For each target output value
+    for target_value in target_values:
+        matches_for_this_value = []
+
+        # Try each script type separately (only combine inputs of same type)
+        for script_type, inputs_of_type in inputs_by_script_type.items():
+            # Filter out inputs already used in other combinations
+            available_inputs = [
+                inp for inp in inputs_of_type
+                if inp.script_pubkey_address not in used_in_combinations
+            ]
+
+            # Try different combination sizes
+            for combo_size in range(MIN_COMBINATION_SIZE, MAX_COMBINATION_SIZE + 1):
+                # Skip if not enough inputs available
+                if len(available_inputs) < combo_size:
+                    continue
+
+                # Generate combinations of this size
+                for combo in combinations(available_inputs, combo_size):
+                    # Calculate sum
+                    total_value = sum(inp.input_value_satoshi for inp in combo)
+
+                    # Check if it matches the target
+                    if total_value == target_value:
+                        # Store the match
+                        addresses = [inp.script_pubkey_address for inp in combo]
+                        script_types = [inp.script_pubkey_type for inp in combo]
+                        values = [inp.input_value_satoshi for inp in combo]
+
+                        # Mark these inputs as used (greedy approach)
+                        for inp in combo:
+                            used_in_combinations.add(inp.script_pubkey_address)
+
+                        matches_for_this_value.append({
+                            'addresses': addresses,
+                            'script_types': script_types,
+                            'values': values,
+                            'size': combo_size
+                        })
+
+                        # Break after finding first match for this type/size to avoid reusing inputs
+                        break
+
+        if matches_for_this_value:
+            subset_matches[target_value] = matches_for_this_value
+            if show_details:
+                print(f"  Value {target_value:,}: Found {len(matches_for_this_value)} matching combinations")
+
+            # Try to add all matches to the anonymity set if there's space
+            if show_debug:
+                print(f"    [DEBUG] Checking if can add matches to anonymity set...")
+                print(f"    [DEBUG] Target value in anonsets: {str(target_value) in anonsets}")
+
+            if str(target_value) in anonsets:
+                cur = anonsets[str(target_value)]
+                outset = cur["outset"]
+                outset: set
+                inset = cur["inset"]
+                inset: set
+                output_type_counts = cur["output_type_counts"]
+                input_type_counts = cur["input_type_counts"]
+                input_distinct_count = cur["inputs_added_for_distinct_outputs"]
+
+                matches_added = 0
+                total_inputs_added = 0
+
+                # Try to add all matches
+                for match_idx, match in enumerate(matches_for_this_value):
+                    match_addresses = match['addresses']
+                    match_script_type = match['script_types'][0]  # All same type in combination
+
+                    if show_debug:
+                        print(f"    [DEBUG] Match {match_idx + 1}: {len(match_addresses)} addresses, type: {match_script_type}")
+
+                    # Check if there's space in the anonymity set
+                    remaining_slots = len(outset) - len(inset)
+                    if show_debug:
+                        print(f"    [DEBUG]   Remaining slots: {remaining_slots} (outset: {len(outset)}, inset: {len(inset)})")
+
+                    # Check if output has this script type
+                    output_count_for_type = output_type_counts.get(match_script_type, 0)
+                    input_count_for_type = input_type_counts.get(match_script_type, 0)
+                    input_count_distinct_output = input_distinct_count.get(match_script_type, 0)
+                    type_slots_available = output_count_for_type - input_count_distinct_output
+
+                    if show_debug:
+                        print(f"    [DEBUG]   Type slots available for {match_script_type}: {type_slots_available} (output: {output_count_for_type}, distinct inputs: {input_count_distinct_output})")
+
+                    # Calculate how many we can add
+                    can_add = min(remaining_slots, type_slots_available, len(match_addresses))
+                    if show_debug:
+                        print(f"    [DEBUG]   Can add: {can_add} (need: {len(match_addresses)})")
+
+                    if can_add > 0:
+                        # Add all addresses from this match to the anonymity set
+                        for addr in match_addresses:
+                            inset.add(addr)
+                            input_count += 1
+                            total_inputs_added += 1
+
+                        # Update input type count
+                        input_type_counts[match_script_type] = input_type_counts.get(match_script_type, 0) + len(match_addresses)
+                        input_distinct_count[match_script_type] = input_count_distinct_output + 1
+
+                        matches_added += 1
+                        if show_debug:
+                            print(f"    ✓ Added match {match_idx + 1}: {len(match_addresses)} inputs to anonymity set")
+                    else:
+                        if show_debug:
+                            print(f"    ✗ Could not add match {match_idx + 1}: insufficient space")
+                            if can_add < len(match_addresses):
+                                print(f"      Reason: Need {len(match_addresses)} slots but only {can_add} available")
+
+                if show_debug and matches_added > 0:
+                    print(f"    Summary: Added {matches_added} match(es) with {total_inputs_added} total inputs to anonymity set")
+                elif show_debug:
+                    print(f"    Summary: No matches could be added to anonymity set")
+
+            else:
+                if show_debug:
+                    print(f"    [DEBUG] No anonymity set found for value {target_value}")
+
+    if show_details:
+        print(f"\nTotal output values with subset matches: {len(subset_matches)}")
+        print("=" * 120)
+        print("\n")
+
+    return subset_matches, used_in_combinations, input_count
 
 
 def print_transaction_side_by_side(tx):
@@ -101,28 +479,7 @@ def main():
     # ========================================================================
     # SETUP PHASE: Create sets for easy membership checking and removal
     # ========================================================================
-
-    # Create a set of all input addresses for quick lookup
-    all_input_addresses = {inp.script_pubkey_address for inp in tx.inputs}
-
-    # Create a set of all output addresses for quick lookup
-    all_output_addresses = {out.script_pubkey_address for out in tx.outputs}
-
-    # Create sets grouped by value and script type for inputs
-    inputs_by_value_and_type = {}
-    for inp in tx.inputs:
-        key = (inp.input_value_satoshi, inp.script_pubkey_type)
-        if key not in inputs_by_value_and_type:
-            inputs_by_value_and_type[key] = set()
-        inputs_by_value_and_type[key].add(inp.script_pubkey_address)
-
-    # Create sets grouped by value and script type for outputs
-    outputs_by_value_and_type = {}
-    for out in tx.outputs:
-        key = (out.output_value_satoshi, out.script_pubkey_type)
-        if key not in outputs_by_value_and_type:
-            outputs_by_value_and_type[key] = set()
-        outputs_by_value_and_type[key].add(out.script_pubkey_address)
+    all_input_addresses, all_output_addresses, inputs_by_value_and_type, outputs_by_value_and_type = setup_phase(tx)
 
     if SHOW_SETUP_PHASE:
         print("=" * 120)
@@ -138,261 +495,46 @@ def main():
         print("\n")
 
     # ========================================================================
-    # ANALYSIS PHASE: Build anonymity sets
+    # FIRST PASS: Build anonymity sets from outputs
     # ========================================================================
+    anonsets, avasets, output_count = first_pass_build_anonymity_sets(tx)
 
-    output_count = 0
-    input_count = 0
-    avasets = set()
-    anonsets = {}
-
-    # First pass: Build anonymity sets from outputs and track script type counts
-    for out in tx.outputs:
-        if out.output_value_satoshi not in avasets:
-            anonsets[str(out.output_value_satoshi)] = {
-                "outset": {out.script_pubkey_address},
-                "inset": set(),
-                "set_state": out.script_pubkey_type,
-                "anon_size": 1,
-                "output_type_counts": {out.script_pubkey_type: 1},  # Track script types in outputs
-                "input_type_counts": {},  # Track script types added as inputs
-                "inputs_added_for_distinct_outputs": {}
-            }
-            avasets.add(out.output_value_satoshi)
-            output_count += 1
-        else:
-            cur = anonsets[str(out.output_value_satoshi)]
-            outset = cur["outset"]
-            outset: set
-            outset.add(out.script_pubkey_address)
-            cur["anon_size"] += 1
-
-            # Update script type count for this output
-            if out.script_pubkey_type in cur["output_type_counts"]:
-                cur["output_type_counts"][out.script_pubkey_type] += 1
-            else:
-                cur["output_type_counts"][out.script_pubkey_type] = 1
-
-            output_count += 1
-            if cur["set_state"] != out.script_pubkey_type:
-                cur["set_state"] = "other" 
-        
-
-
-    # Second pass: Add inputs to anonymity sets, respecting script type distribution
-    # Iterate over the grouped input sets for efficiency
-    for (value, script_type), input_addrs in inputs_by_value_and_type.items():
-        if value in avasets:
-            cur = anonsets[str(value)]
-            outset = cur["outset"]
-            inset = cur["inset"]
-            output_type_counts = cur["output_type_counts"]
-            input_type_counts = cur["input_type_counts"]
-            input_distinct_count = cur["inputs_added_for_distinct_outputs"] #how many outputs are matched with inputs output_count - this = unmatched outputs (counts are typed)
-
-            # Get the count of this script type in outputs
-            output_count_for_type = output_type_counts.get(script_type, 0)
-
-            # Skip if this script type doesn't exist in outputs
-            if output_count_for_type == 0:
-                continue
-
-            # Get the count of this script type already added as inputs
-            input_count_for_type = input_type_counts.get(script_type, 0)
-            input_count_distinct_output = input_distinct_count.get(script_type, 0)
-            # Calculate how many more inputs of this type we can add
-            slots_available = min(
-                output_count_for_type - input_count_for_type,  # Type-specific slots
-                len(outset) - len(inset)  # Total slots in anonymity set
-            )
-
-            if slots_available > 0:
-                # Convert to list to allow removal during iteration
-                input_addrs_list = list(input_addrs)
-
-                for addr in input_addrs_list[:slots_available]:
-                    inset.add(addr)
-                    input_count += 1
-                    input_type_counts[script_type] = input_count_for_type + 1
-                    input_distinct_count[script_type] = input_count_distinct_output + 1
-
-                    # Remove from setup sets
-                    all_input_addresses.discard(addr)
-                    input_addrs.discard(addr)
-
-                # Update input type count
-                
-
-    # Third pass: Subset sum matching - find combinations of inputs that match output values
     # ========================================================================
-    if SHOW_SUBSET_SUM_DETAILS:
-        print("=" * 120)
-        print("THIRD PASS: Subset Sum Matching")
-        print("=" * 120)
+    # SECOND PASS: Add inputs to anonymity sets
+    # ========================================================================
+    input_count = second_pass_add_inputs_to_anonsets(
+        inputs_by_value_and_type=inputs_by_value_and_type,
+        avasets=avasets,
+        anonsets=anonsets,
+        all_input_addresses=all_input_addresses
+    )
 
-        print(f"Remaining unmatched inputs: {len(all_input_addresses)}")
+    # ========================================================================
+    # THIRD PASS: Divide bigger inputs into smaller outputs
+    # ========================================================================
+    division_count = third_pass_divide_large_inputs(
+        tx=tx,
+        all_input_addresses=all_input_addresses,
+        inputs_by_value_and_type=inputs_by_value_and_type,
+        anonsets=anonsets,
+        avasets=avasets,
+        show_debug=SHOW_SUBSET_SUM_DETAILS
+    )
 
-    # Get target output values to search for
-    target_values = sorted(avasets, reverse=True)
-    max_target_value = max(target_values) if target_values else 0
+    # ========================================================================
+    # FOURTH PASS: Subset sum matching
+    # ========================================================================
+    subset_matches, used_in_combinations, subset_input_count = fourth_pass_subset_sum_matching(
+        tx=tx,
+        all_input_addresses=all_input_addresses,
+        avasets=avasets,
+        anonsets=anonsets,
+        show_details=SHOW_SUBSET_SUM_DETAILS,
+        show_debug=SHOW_SUBSET_SUM_DEBUG
+    )
 
-    # Filter inputs - only keep those still unmatched and smaller than max output value
-    candidate_inputs = [
-        inp for inp in tx.inputs
-        if inp.script_pubkey_address in all_input_addresses
-        and inp.input_value_satoshi < max_target_value
-    ]
-    if SHOW_SUBSET_SUM_DETAILS:
-        print(f"Candidate inputs (< max output value): {len(candidate_inputs)}")
-
-    # Configuration
-    MAX_COMBINATION_SIZE = 5  # Check combinations of 2-10 inputs
-    MIN_COMBINATION_SIZE = 2
-
-    # Track subset sum matches
-    subset_matches = {}  # output_value -> list of (input_combination, total_value)
-    used_in_combinations = set()  # Track inputs already used in combinations
-
-    from itertools import combinations
-
-    # Group candidate inputs by script type for same-type combinations
-    inputs_by_script_type = {}
-    for inp in candidate_inputs:
-        if inp.script_pubkey_type not in inputs_by_script_type:
-            inputs_by_script_type[inp.script_pubkey_type] = []
-        inputs_by_script_type[inp.script_pubkey_type].append(inp)
-
-    if SHOW_SUBSET_SUM_DETAILS:
-        print(f"Input groups by script type: {[(st, len(inps)) for st, inps in inputs_by_script_type.items()]}")
-        print()
-
-    # For each target output value
-    for target_value in target_values:
-        matches_for_this_value = []
-
-        # Try each script type separately (only combine inputs of same type)
-        for script_type, inputs_of_type in inputs_by_script_type.items():
-            # Filter out inputs already used in other combinations
-            available_inputs = [
-                inp for inp in inputs_of_type
-                if inp.script_pubkey_address not in used_in_combinations
-            ]
-
-            # Try different combination sizes
-            for combo_size in range(MIN_COMBINATION_SIZE, MAX_COMBINATION_SIZE + 1):
-                # Skip if not enough inputs available
-                if len(available_inputs) < combo_size:
-                    continue
-
-                # Generate combinations of this size
-                for combo in combinations(available_inputs, combo_size):
-                    # Calculate sum
-                    total_value = sum(inp.input_value_satoshi for inp in combo)
-
-                    # Check if it matches the target
-                    if total_value == target_value:
-                        # Store the match
-                        addresses = [inp.script_pubkey_address for inp in combo]
-                        script_types = [inp.script_pubkey_type for inp in combo]
-                        values = [inp.input_value_satoshi for inp in combo]
-
-                        # Mark these inputs as used (greedy approach)
-                        for inp in combo:
-                            used_in_combinations.add(inp.script_pubkey_address)
-
-                        matches_for_this_value.append({
-                            'addresses': addresses,
-                            'script_types': script_types,
-                            'values': values,
-                            'size': combo_size
-                        })
-
-                        # Break after finding first match for this type/size to avoid reusing inputs
-                        break
-
-        if matches_for_this_value:
-            subset_matches[target_value] = matches_for_this_value
-            if SHOW_SUBSET_SUM_DETAILS:
-                print(f"  Value {target_value:,}: Found {len(matches_for_this_value)} matching combinations")
-
-            # Try to add all matches to the anonymity set if there's space
-            if SHOW_SUBSET_SUM_DEBUG:
-                print(f"    [DEBUG] Checking if can add matches to anonymity set...")
-                print(f"    [DEBUG] Target value in anonsets: {str(target_value) in anonsets}")
-
-            if str(target_value) in anonsets:
-                cur = anonsets[str(target_value)]
-                outset = cur["outset"]
-                outset: set
-                inset = cur["inset"]
-                inset: set
-                output_type_counts = cur["output_type_counts"]
-                input_type_counts = cur["input_type_counts"]
-                input_distinct_count = cur["inputs_added_for_distinct_outputs"] #how many outputs are matched with inputs output_count - this = unmatched outputs (counts are typed)
-
-                matches_added = 0
-                total_inputs_added = 0
-
-                # Try to add all matches
-                for match_idx, match in enumerate(matches_for_this_value):
-                    match_addresses = match['addresses']
-                    match_script_type = match['script_types'][0]  # All same type in combination
-
-                    if SHOW_SUBSET_SUM_DEBUG:
-                        print(f"    [DEBUG] Match {match_idx + 1}: {len(match_addresses)} addresses, type: {match_script_type}")
-
-                    # Check if there's space in the anonymity set
-                    remaining_slots = len(outset) - len(inset)
-                    if SHOW_SUBSET_SUM_DEBUG:
-                        print(f"    [DEBUG]   Remaining slots: {remaining_slots} (outset: {len(outset)}, inset: {len(inset)})")
-
-                    # Check if output has this script type
-                    output_count_for_type = output_type_counts.get(match_script_type, 0)
-                    input_count_for_type = input_type_counts.get(match_script_type, 0)
-                    input_count_distinct_output = input_distinct_count.get(match_script_type, 0)
-                    type_slots_available = output_count_for_type - input_count_distinct_output
-
-                    if SHOW_SUBSET_SUM_DEBUG:
-                        print(f"    [DEBUG]   Type slots available for {match_script_type}: {type_slots_available} (output: {output_count_for_type}, distinct inputs: {input_count_distinct_output})")
-
-                    # Calculate how many we can add
-                    can_add = min(remaining_slots, type_slots_available, len(match_addresses))
-                    if SHOW_SUBSET_SUM_DEBUG:
-                        print(f"    [DEBUG]   Can add: {can_add} (need: {len(match_addresses)})")
-
-                    if can_add > 0:
-                        # Add all addresses from this match to the anonymity set
-                        for addr in match_addresses:
-                            inset.add(addr)
-                            input_count += 1
-                            total_inputs_added += 1
-
-                        # Update input type count
-                        input_type_counts[match_script_type] = input_type_counts.get(match_script_type, 0) + len(match_addresses)
-                        input_distinct_count[match_script_type] = input_count_distinct_output + 1
-
-                        matches_added += 1
-                        if SHOW_SUBSET_SUM_DEBUG:
-                            print(f"    ✓ Added match {match_idx + 1}: {len(match_addresses)} inputs to anonymity set")
-                    else:
-                        if SHOW_SUBSET_SUM_DEBUG:
-                            print(f"    ✗ Could not add match {match_idx + 1}: insufficient space")
-                            if can_add < len(match_addresses):
-                                print(f"      Reason: Need {len(match_addresses)} slots but only {can_add} available")
-
-                if SHOW_SUBSET_SUM_DEBUG and matches_added > 0:
-                    print(f"    Summary: Added {matches_added} match(es) with {total_inputs_added} total inputs to anonymity set")
-                elif SHOW_SUBSET_SUM_DEBUG:
-                    print(f"    Summary: No matches could be added to anonymity set")
-
-            else:
-                if SHOW_SUBSET_SUM_DEBUG:
-                    print(f"    [DEBUG] No anonymity set found for value {target_value}")
-
-    if SHOW_SUBSET_SUM_DETAILS:
-        print(f"\nTotal output values with subset matches: {len(subset_matches)}")
-        print("=" * 120)
-        print("\n")
+    # Add subset sum matched inputs to total count
+    input_count += subset_input_count
 
     # Display subset sum match details
     if SHOW_SUBSET_SUM_DETAILS and subset_matches:
