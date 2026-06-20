@@ -153,16 +153,259 @@ def second_pass_add_inputs_to_anonsets(
     return input_count
 
 
+def find_output_combination_greedy(
+    available_value: int,
+    target_values: List[int],
+    max_outputs: int = 5,
+    min_usage_ratio: float = 0.90
+) -> Dict[int, int]:
+    """
+    Find combination of output values using greedy algorithm (largest denominations first).
+
+    This function attempts to divide an available input value into multiple output
+    denominations by greedily selecting the largest denominations first.
+
+    Args:
+        available_value: The value available to divide (after fees)
+        target_values: List of output denominations to use (should be sorted descending)
+        max_outputs: Maximum number of outputs to use (default: 5)
+        min_usage_ratio: Minimum ratio of value that must be used (default: 0.90 = 90%)
+
+    Returns:
+        Dictionary mapping {output_value: count} showing how many of each denomination,
+        or empty dict if no viable division found
+
+    Example:
+        >>> find_output_combination_greedy(100000, [50000, 25000, 10000], max_outputs=3)
+        {50000: 2}  # Uses 100000 sats exactly
+
+        >>> find_output_combination_greedy(95000, [50000, 25000, 10000], max_outputs=3)
+        {50000: 1, 25000: 1, 10000: 2}  # Uses 95000 sats exactly
+    """
+    result = {}
+    remaining = available_value
+    outputs_used = 0
+
+    # Sort target values descending (largest first)
+    sorted_targets = sorted(target_values, reverse=True)
+
+    for target_value in sorted_targets:
+        if remaining <= 0 or outputs_used >= max_outputs:
+            break
+
+        # Calculate how many of this denomination we can fit
+        max_count_by_value = remaining // target_value
+        max_count_by_limit = max_outputs - outputs_used
+
+        count = min(max_count_by_value, max_count_by_limit)
+
+        if count > 0:
+            result[target_value] = count
+            remaining -= target_value * count
+            outputs_used += count
+
+    # Check if we used enough of the available value
+    total_used = sum(value * count for value, count in result.items())
+    usage_ratio = total_used / available_value if available_value > 0 else 0
+
+    if usage_ratio >= min_usage_ratio:
+        return result
+
+    # Not enough value used, return empty
+    return {}
+
+
+def find_output_combination_dp(
+    available_value: int,
+    target_values: List[int],
+    max_outputs: int = 5,
+    min_usage_ratio: float = 0.90,
+    tolerance: int = 1000
+) -> Dict[int, int]:
+    """
+    Find combination of output values using dynamic programming for optimal matching.
+
+    This function uses dynamic programming with memoization to find the best combination
+    of output denominations that minimizes leftover value. More computationally expensive
+    than greedy but finds better matches.
+
+    Args:
+        available_value: The value available to divide (after fees)
+        target_values: List of output denominations to use
+        max_outputs: Maximum number of outputs to use (default: 5)
+        min_usage_ratio: Minimum ratio of value that must be used (default: 0.90 = 90%)
+        tolerance: Acceptable difference from target in satoshis (default: 1000)
+
+    Returns:
+        Dictionary mapping {output_value: count} showing how many of each denomination,
+        or empty dict if no viable division found
+
+    Example:
+        >>> find_output_combination_dp(100000, [50000, 25000, 10000], max_outputs=3)
+        {50000: 2}  # Uses 100000 sats exactly (0 leftover)
+
+        >>> find_output_combination_dp(97000, [50000, 25000, 10000], max_outputs=3)
+        {50000: 1, 25000: 1, 10000: 2}  # Uses 95000 sats (2000 leftover, within tolerance)
+    """
+    from functools import lru_cache
+
+    # Filter and sort target values (largest first for better performance)
+    valid_targets = sorted([v for v in target_values if v <= available_value], reverse=True)
+
+    if not valid_targets:
+        return {}
+
+    # DP state: (remaining_value, outputs_used, target_idx) -> (best_remaining, best_combination)
+    @lru_cache(maxsize=10000)
+    def dp(remaining: int, num_outputs: int, idx: int) -> Tuple[int, Tuple]:
+        """
+        Returns (remaining_value, combination_tuple) for best solution.
+        Lower absolute remaining_value is better (closer to using all available value).
+        Combination is stored as tuple of (value, count) pairs for hashability.
+        """
+        # Base cases
+        if num_outputs >= max_outputs or idx >= len(valid_targets):
+            # No more outputs to try, return current remaining
+            return (remaining, ())
+
+        if abs(remaining) <= tolerance:
+            # Found a good match within tolerance
+            return (remaining, ())
+
+        if remaining < 0:
+            # Overshot - this is invalid, return large penalty
+            return (float('inf'), ())
+
+        target = valid_targets[idx]
+
+        # Option 1: Skip this denomination entirely
+        skip_remaining, skip_combo = dp(remaining, num_outputs, idx + 1)
+        best_remaining = skip_remaining
+        best_combo = skip_combo
+
+        # Option 2: Use this denomination (try different counts)
+        max_count = min(remaining // target, max_outputs - num_outputs)
+
+        for count in range(1, max_count + 1):
+            new_remaining = remaining - target * count
+            sub_remaining, sub_combo = dp(new_remaining, num_outputs + count, idx + 1)
+
+            # Check if this solution is better (lower absolute remaining value)
+            if abs(sub_remaining) < abs(best_remaining):
+                best_remaining = sub_remaining
+                # Build combination tuple: current + sub-results
+                best_combo = ((target, count),) + sub_combo
+
+        return (best_remaining, best_combo)
+
+    # Run DP algorithm
+    remaining_value, combination_tuple = dp(available_value, 0, 0)
+
+    # Convert tuple back to dictionary
+    combination = {}
+    for item in combination_tuple:
+        if len(item) == 2:
+            value, count = item
+            combination[value] = count
+
+    # Check if we used enough of the available value
+    total_used = sum(val * count for val, count in combination.items())
+    usage_ratio = total_used / available_value if available_value > 0 else 0
+
+    # Accept if within tolerance and meets minimum usage ratio
+    # For large values, scale tolerance proportionally (0.1% of available value)
+    dynamic_tolerance = max(tolerance * 2, int(available_value * 0.001))
+
+    if abs(remaining_value) <= dynamic_tolerance and usage_ratio >= min_usage_ratio:
+        return combination
+
+    # Not good enough, return empty
+    return {}
+
+
+def divide_input_into_outputs(
+    input_value: int,
+    script_type: str,
+    target_values: List[int],
+    coordinator_fee_rate: float = 0.003,
+    mining_fee_per_input: int = 68,
+    max_outputs: int = 5,
+    min_usage_ratio: float = 0.90,
+    algorithm: str = "greedy",
+    tolerance: int = 1000
+) -> Dict[int, int]:
+    """
+    Divide a single input value into multiple output denominations.
+
+    This is a high-level function that handles fee calculation and delegates
+    to either greedy or DP algorithm based on the algorithm parameter.
+
+    Args:
+        input_value: The input value in satoshis
+        script_type: Script type of the input (for reference, not used in calculation)
+        target_values: List of available output denominations
+        coordinator_fee_rate: Coordinator fee as decimal (default: 0.003 = 0.3%)
+        mining_fee_per_input: Mining fee per input in satoshis (default: 68)
+        max_outputs: Maximum outputs to divide into (default: 5)
+        min_usage_ratio: Minimum ratio of value that must be used (default: 0.90)
+        algorithm: Algorithm to use - "greedy" or "dp" (default: "greedy")
+        tolerance: Tolerance for DP algorithm in satoshis (default: 1000)
+
+    Returns:
+        Dictionary mapping {output_value: count} or empty dict if no viable division
+
+    Example:
+        >>> divide_input_into_outputs(100000, "v1_p2tr", [50000, 25000, 10000])
+        {50000: 1, 25000: 1, 10000: 2}
+    """
+    # Calculate net available value after fees
+    net_value = input_value - mining_fee_per_input
+    coordinator_leftover = int(net_value * coordinator_fee_rate)
+    available_value = net_value - coordinator_leftover
+
+    # Check if we have enough value to divide
+    if available_value <= 0 or (target_values and available_value < min(target_values)):
+        return {}
+
+    # Choose algorithm
+    if algorithm == "dp":
+        return find_output_combination_dp(
+            available_value=available_value,
+            target_values=target_values,
+            max_outputs=max_outputs,
+            min_usage_ratio=min_usage_ratio,
+            tolerance=tolerance
+        )
+    else:  # greedy (default)
+        return find_output_combination_greedy(
+            available_value=available_value,
+            target_values=target_values,
+            max_outputs=max_outputs,
+            min_usage_ratio=min_usage_ratio
+        )
+
+
 def third_pass_divide_large_inputs(
     tx,
     all_input_addresses: Set,
     inputs_by_value_and_type: Dict,
     anonsets: Dict,
     avasets: Set,
+    coordinator_fee_rate: float = 0.003,
+    mining_fee_per_input: int = 68,
+    max_outputs_per_input: int = 5,
+    min_usage_ratio: float = 0.90,
+    algorithm: str = "greedy",
+    tolerance: int = 1000,
     show_debug: bool = False
 ) -> int:
     """
     THIRD PASS: Divide bigger inputs into smaller outputs
+
+    This function identifies large inputs that can be divided into multiple smaller output
+    denominations. It supports both greedy and dynamic programming algorithms, and accounts
+    for transaction fees and coordinator fees. The same input can contribute to multiple
+    outputs in anonymity sets while respecting script type matching.
 
     Args:
         tx: CoinjoinTransaction object
@@ -170,21 +413,180 @@ def third_pass_divide_large_inputs(
         inputs_by_value_and_type: Dictionary mapping (value, script_type) -> set of addresses
         anonsets: Dictionary of anonymity sets (modified in-place)
         avasets: Set of available output values
+        coordinator_fee_rate: Coordinator fee as decimal (default: 0.003 = 0.3%)
+        mining_fee_per_input: Average mining fee per input in satoshis (default: 68)
+        max_outputs_per_input: Maximum outputs to divide into (default: 5)
+        min_usage_ratio: Minimum ratio of value that must be used (default: 0.90 = 90%)
+        algorithm: Algorithm to use - "greedy" or "dp" (default: "greedy")
+        tolerance: Tolerance for DP algorithm in satoshis (default: 1000)
         show_debug: Whether to show debug output
 
     Returns:
         division_count: Number of inputs successfully divided
+
+    Example:
+        Input: 100,000 sats (after fees: 99,632 sats)
+        Outputs: [50,000, 25,000, 10,000]
+        Result: Divides into 1x50000 + 1x25000 + 2x10000 + 4,632 leftover
     """
-    # TODO: Implement dynamic programming division algorithm
-    # This will be implemented in the next step
-    division_count = 0
+    algorithm_name = "Dynamic Programming" if algorithm == "dp" else "Greedy"
 
     if show_debug:
         print("=" * 120)
-        print("THIRD PASS: Large Input Division (Not yet implemented)")
+        print(f"THIRD PASS: Large Input Division ({algorithm_name} Algorithm)")
         print("=" * 120)
         print(f"Remaining unmatched inputs: {len(all_input_addresses)}")
+        print(f"Coordinator fee rate: {coordinator_fee_rate * 100:.1f}%")
+        print(f"Mining fee per input: {mining_fee_per_input} sats")
+        print(f"Max outputs per input: {max_outputs_per_input}")
+        print(f"Min usage ratio: {min_usage_ratio * 100:.0f}%")
+        if algorithm == "dp":
+            print(f"DP tolerance: {tolerance} sats")
+
+    # Get available output denominations sorted descending
+    target_values = sorted(list(avasets), reverse=True)
+
+    if not target_values:
+        if show_debug:
+            print("No target output values available")
+            print("=" * 120)
+        return 0
+
+    min_output_value = min(target_values)
+
+    # Track successfully divided inputs
+    successfully_divided = set()
+    division_count = 0
+
+    # Process each input group
+    for (input_value, script_type), input_addrs in inputs_by_value_and_type.items():
+        # Skip if already matched or too small to divide
+        unmatched_inputs = input_addrs & all_input_addresses
+
+        if not unmatched_inputs or input_value < min_output_value:
+            continue
+
+        # Calculate net available value after fees
+        net_value = input_value - mining_fee_per_input
+        coordinator_leftover = int(net_value * coordinator_fee_rate)
+        available_value = net_value - coordinator_leftover
+
+        # Skip if not enough value left after fees
+        if available_value < min_output_value:
+            continue
+
+        if show_debug:
+            print(f"\n{'─' * 80}")
+            print(f"Processing input: {input_value:,} sats (script_type: {script_type})")
+            print(f"  Net after mining fee ({mining_fee_per_input} sats): {net_value:,} sats")
+            print(f"  Coordinator fee ({coordinator_fee_rate*100:.1f}%): {coordinator_leftover:,} sats")
+            print(f"  Available for division: {available_value:,} sats")
+
+        # Use the modular function to divide input
+        division_result = divide_input_into_outputs(
+            input_value=input_value,
+            script_type=script_type,
+            target_values=target_values,
+            coordinator_fee_rate=coordinator_fee_rate,
+            mining_fee_per_input=mining_fee_per_input,
+            max_outputs=max_outputs_per_input,
+            min_usage_ratio=min_usage_ratio,
+            algorithm=algorithm,
+            tolerance=tolerance
+        )
+
+        if not division_result:
+            if show_debug:
+                print(f"  ✗ No viable division found (couldn't use ≥{min_usage_ratio*100:.0f}% of value)")
+            continue
+
+        # Calculate usage statistics
+        total_divided = sum(val * count for val, count in division_result.items())
+        leftover = available_value - total_divided
+        usage_ratio = (total_divided / available_value) * 100
+
+        if show_debug:
+            print(f"  ✓ Division found:")
+            for output_value, count in sorted(division_result.items(), reverse=True):
+                print(f"    • {count}x {output_value:,} sats = {count * output_value:,} sats")
+            print(f"  Total divided: {total_divided:,} sats ({usage_ratio:.1f}%)")
+            print(f"  Leftover: {leftover:,} sats")
+
+        # Process each input address in this group
+        for input_addr in list(unmatched_inputs):
+            added_to_any_set = False
+            additions_summary = []
+
+            # Try to add this input to anonymity sets based on division result
+            for output_value, output_count in division_result.items():
+                if str(output_value) not in anonsets:
+                    continue
+
+                cur = anonsets[str(output_value)]
+                inset = cur["inset"]
+                outset = cur["outset"]
+                output_type_counts = cur["output_type_counts"]
+                input_type_counts = cur["input_type_counts"]
+                input_distinct_count = cur["inputs_added_for_distinct_outputs"]
+
+                # Check script type compatibility
+                output_count_for_type = output_type_counts.get(script_type, 0)
+                if output_count_for_type == 0:
+                    if show_debug:
+                        additions_summary.append(f"    ✗ {output_value:,} sats: No outputs with matching script type")
+                    continue
+
+                input_count_for_type = input_type_counts.get(script_type, 0)
+                input_count_distinct = input_distinct_count.get(script_type, 0)
+
+                # Calculate how many slots available
+                total_slots = len(outset) - len(inset)
+                type_distinct_slots = output_count_for_type - input_count_distinct
+
+                slots_available = min(
+                    total_slots,
+                    type_distinct_slots,
+                    output_count  # Number of this denomination in division
+                )
+
+                if slots_available > 0:
+                    # Add input address to this anonymity set
+                    inset.add(input_addr)
+
+                    # Update counts
+                    input_type_counts[script_type] = input_count_for_type + slots_available
+                    input_distinct_count[script_type] = input_count_distinct + 1
+
+                    added_to_any_set = True
+                    additions_summary.append(f"    ✓ Added to {output_value:,} sats set ({slots_available} slot(s))")
+                else:
+                    reason = "no total slots" if total_slots == 0 else \
+                             "no type-specific slots" if type_distinct_slots == 0 else \
+                             "division count is 0"
+                    additions_summary.append(f"    ✗ {output_value:,} sats: No slots available ({reason})")
+
+            # If successfully added to at least one set, mark as divided
+            if added_to_any_set:
+                successfully_divided.add(input_addr)
+                all_input_addresses.discard(input_addr)
+                input_addrs.discard(input_addr)
+                division_count += 1
+
+                if show_debug:
+                    print(f"  Input address {input_addr[:20]}...:")
+                    for summary in additions_summary:
+                        print(summary)
+            else:
+                if show_debug:
+                    print(f"  ✗ Could not add input {input_addr[:20]}... to any anonymity set:")
+                    for summary in additions_summary:
+                        print(summary)
+
+    if show_debug:
+        print(f"\n{'─' * 80}")
+        print(f"✓ Successfully divided {division_count} large input(s)")
         print("=" * 120)
+        print()
 
     return division_count
 
@@ -453,6 +855,8 @@ def main():
     parser.add_argument('-tx', action='store_true', help='Show transaction side-by-side view')
     parser.add_argument('--tx-id', type=str, default="EEED55F383A51A566829F58EC229C81C793186923FEDE2C4FE8E0062743A48CB",
                         help='Transaction ID to analyze')
+    parser.add_argument('--division-algo', type=str, choices=['greedy', 'dp'], default='greedy',
+                        help='Algorithm for dividing large inputs: greedy (default) or dp (dynamic programming)')
 
     args = parser.parse_args()
 
@@ -518,6 +922,7 @@ def main():
         inputs_by_value_and_type=inputs_by_value_and_type,
         anonsets=anonsets,
         avasets=avasets,
+        algorithm=args.division_algo,
         show_debug=SHOW_SUBSET_SUM_DETAILS
     )
 
